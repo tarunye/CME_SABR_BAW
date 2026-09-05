@@ -1,0 +1,2 @@
+reference_date,expiry_date,spot,forward,time_to_expiry_years,risk_free_rate,cost_of_carry,implied_dividend_yield,sabr_beta,calibration_moneyness_band
+2023-12-29,2024-02-16,475.31,478.8920167222817,0.13424657534246576,0.054,0.05592630141602003,-0.0019263014160200292,1.0,0.15

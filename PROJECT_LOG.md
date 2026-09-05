@@ -4,7 +4,7 @@ Running record of what has been built, decided, and deferred. Append-only: each 
 a section, nothing earlier gets rewritten. If you are picking this project up cold, read
 this file top to bottom and you will know exactly where things stand.
 
-**Current status: Phase 0 complete. Awaiting approval for Phase 1.**
+**Current status: Phase 1 complete. Awaiting approval for Phase 2.**
 
 ---
 
@@ -146,6 +146,124 @@ falls between 2023-12-29 and 2024-02-16.** Plugging in SPY's ~1.4% trailing yiel
 have mispriced the forward by about $0.90 — roughly four strike increments — and tilted
 the entire smile. The near-zero implied yield is independent corroboration that the 5.40%
 rate assumption is sound.
+
+---
+
+## PHASE 1 — SABR calibration ✅ complete, awaiting approval
+
+### What was built
+
+`sabr.py`, containing the Hagan et al. (2002) lognormal implied volatility expansion and a
+least-squares calibration of `alpha`, `rho`, `nu` to the observed smile. Plus
+`plot_sabr_fit` in `plots.py` and a Phase 1 runner in `main.py`.
+
+Runnable standalone: `python3 sabr.py`.
+
+### Key results
+
+Calibrated to 103 strikes ($408-$550, |moneyness| ≤ 15%):
+
+| Parameter | Value | Reading |
+|---|---|---|
+| `alpha` | 0.109922 | Vol level. At beta=1 this is close to the ATM vol, so ~11.0% |
+| `beta` | 1.0 | **Fixed**, not fitted |
+| `rho` | −0.510842 | Negative as an equity index should be — vol rises when SPY falls |
+| `nu` | 2.103836 | Vol-of-vol; sets smile curvature |
+
+RMSE **0.2946 vol points**, max abs error 0.6378. ATM skew −0.5461 vol points per 1% move
+in strike (negative = downward skew, correct for an equity index).
+
+### The residuals are a data problem, not a model problem
+
+This is the main finding of Phase 1 and it matters for how much to trust Phase 3 onward.
+
+**The vendor's put and call implied vols are mutually inconsistent.** Put-call parity says
+a put and a call at the same strike must carry the same IV. Ours do not: the put wing ends
+at K=$476 heading for 10.91%, and the call wing opens at K=$479 at 11.67% — a **+0.76 vol
+point step** at the crossover. No smooth curve can fit both wings, so the optimiser splits
+the difference. That is exactly the residual pattern in `sabr_fit.png`: puts sitting at a
+consistent +0.25 vol points, then a sharp drop to −0.6 right at the forward.
+
+Fitting each wing on its own confirms it:
+
+| Fit | Strikes | RMSE | Data noise floor | `rho` |
+|---|---|---|---|---|
+| Both wings | 103 | 0.2946 | 0.1140 | −0.5108 |
+| Puts only | 69 | **0.0751** | 0.0501 | −0.2578 |
+| Calls only | 34 | **0.2036** | 0.1851 | −0.6008 |
+
+Each wing individually fits to **its own noise floor**. The combined RMSE is worse than
+either because the two wings disagree with each other. The "noise floor" column is the RMS
+strike-to-strike jitter in the quoted vols themselves (`data_loader.smile_local_roughness`)
+— a true smile is smooth, so that jitter is quote noise, and a model fitting to it has done
+as well as anything possibly could.
+
+Note the call wing is 3.7× noisier than the put wing (0.185 vs 0.050 vol points). SPY put
+quotes are simply better maintained than call quotes at end of day.
+
+### Sensitivity, and the identification problem made visible
+
+Calibration range (beta fixed at 1.0):
+
+| Band | Strikes | RMSE | Max err | `alpha` | `rho` | `nu` |
+|---|---|---|---|---|---|---|
+| 5% | 46 | 0.2040 | 0.4303 | 0.1126 | −0.5097 | 1.7349 |
+| 10% | 74 | 0.2349 | 0.4926 | 0.1117 | −0.5198 | 1.9425 |
+| **15%** | **103** | **0.2946** | **0.6378** | **0.1099** | **−0.5108** | **2.1038** |
+| 20% | 118 | 0.3602 | 0.9800 | 0.1086 | −0.5033 | 2.1887 |
+| 30% | 128 | 0.5532 | 1.6850 | 0.1057 | −0.4985 | 2.3326 |
+| 100% | 151 | 0.8116 | 2.5150 | 0.0991 | −0.4784 | 2.5841 |
+
+RMSE degrades smoothly as the wings are included — 2.8× worse at the full smile — while
+`rho` stays remarkably stable at −0.48 to −0.52. The skew is well determined; it is the
+wings the model cannot reach.
+
+Beta (band fixed at 15%) — **this is the reason beta is not fitted**:
+
+| `beta` | RMSE | `alpha` | `rho` | `nu` |
+|---|---|---|---|---|
+| 0.00 | 0.2548 | 52.3342 | −0.4488 | 2.0076 |
+| 0.30 | 0.2653 | 8.2298 | −0.4681 | 2.0352 |
+| 0.50 | 0.2730 | 2.3979 | −0.4807 | 2.0542 |
+| 0.70 | 0.2813 | 0.6987 | −0.4929 | 2.0737 |
+| **1.00** | **0.2946** | **0.1099** | **−0.5108** | **2.1038** |
+
+RMSE moves by 0.04 vol points across the entire range of beta — nothing — while `alpha`
+swings by a factor of 476 and `rho` slides to compensate. This is the flat valley described
+in `calibrate_sabr`: **the data cannot tell beta and rho apart.** Fitting them jointly
+would produce parameters that jump around day to day while the fit quality never improves.
+
+### Two bugs found and fixed during the phase
+
+1. **`alpha` upper bound did not scale with beta.** At beta=1 alpha is a proportional vol
+   (~0.11); at beta=0 the model is normal and alpha is an *absolute* vol in dollars (~52).
+   A fixed bound of 5.0 made the beta=0 fit throw `Initial guess is outside of provided
+   bounds`. The bound is now `5.0 * forward**(1-beta)` and seeds are clipped inside it.
+2. **The ATM continuity check was measuring the real smile slope**, not a discontinuity,
+   because it probed strikes 0.1% away from the forward where the skew genuinely moves vol
+   by 0.055 vol points. It now probes within a few multiples of the 1e-7 tolerance and
+   subtracts the slope contribution computed from the model's own skew. Result: observed
+   gap 5.515e-04 vol points, explained by skew 5.514e-04, **unexplained excess 4.5e-08** —
+   floating point noise. The branch is clean.
+
+### Decisions taken
+
+1. **`beta` fixed at 1.0, not fitted.** `beta` and `rho` are close to jointly
+   unidentifiable — both control skew and trade off against each other, so a joint fit
+   wanders along a flat valley. 1.0 is the equity index convention: it makes the model
+   lognormal, matching how equity vols are quoted, and leaves `rho` as the clean skew
+   driver. Configurable via `CONFIG["sabr_beta"]`.
+2. **Calibration range `|moneyness| <= 15%`.** Two reasons the full 151-strike smile is
+   the wrong fit target: Hagan's formula is an *asymptotic* expansion that degrades far
+   from the money, and 35 of the 151 strikes have a mid below $0.10 with a median relative
+   spread of 40% — quote noise that would carry equal weight in an unweighted fit and drag
+   the at-the-money region off. Configurable via `CONFIG["calibration_moneyness_band"]`.
+3. **ATM singularity handled by an explicit branch** on `|log(F/K)|` below a tolerance,
+   using the closed-form ATM limit. Flagged `# NOTE (approximation)` in the code and
+   verified continuous across the branch boundary.
+4. **Scalar function plus an explicit loop wrapper**, not a vectorised implementation.
+   The brief prioritises readability, and the `z/x(z)` branch is far clearer as a plain
+   `if`. Performance is irrelevant at this scale.
 
 ---
 

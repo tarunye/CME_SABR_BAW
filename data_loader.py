@@ -496,6 +496,159 @@ def nyse_trading_days(start_date, end_date):
     return weekdays.difference(holidays)
 
 
+def smile_local_roughness(smile):
+    """
+    Measure how noisy the observed smile is, strike by strike.
+
+    WHY THIS EXISTS
+    ---------------
+    When we fit SABR and get an RMSE, the obvious question is "is that good?" -- and the
+    honest answer depends entirely on how clean the data was. If the quoted implied vols
+    themselves jitter by 0.2 vol points from one strike to the next, then a model fitting
+    them to 0.2 vol points has done as well as anything possibly could, and chasing a
+    lower number would just be fitting noise.
+
+    A true volatility smile is a smooth function of strike. So for any interior strike,
+    the observed vol should sit almost exactly on the straight line between its two
+    neighbours; the amount by which it does not is curvature plus noise. At $1 strike
+    spacing the genuine curvature contribution is tiny, so this statistic is dominated by
+    quote noise -- tick granularity, stale marks, and the vendor's IV inversion.
+
+    We report it per side as well as overall, because in practice the two wings are
+    quoted with very different care.
+
+    Inputs:
+        smile (DataFrame): a smile with 'strike', 'market_iv' and 'option_type', sorted
+            ascending by strike.
+
+    Returns:
+        dict with keys 'overall', 'put', 'call' -- each the RMS local roughness as a
+        decimal vol (multiply by 100 for vol points). A side with fewer than 3 strikes
+        returns numpy.nan for that entry.
+    """
+    def rms_roughness(vols):
+        """RMS deviation of each interior point from the midpoint of its neighbours."""
+        vols = np.asarray(vols, dtype=float)
+
+        if len(vols) < 3:
+            return float("nan")
+
+        deviations = vols[1:-1] - 0.5 * (vols[:-2] + vols[2:])
+
+        return float(np.sqrt(np.mean(deviations ** 2)))
+
+    return {
+        "overall": rms_roughness(smile["market_iv"]),
+        "put": rms_roughness(smile.loc[smile["option_type"] == "put", "market_iv"]),
+        "call": rms_roughness(smile.loc[smile["option_type"] == "call", "market_iv"]),
+    }
+
+
+def put_call_crossover_step(smile, n_strikes=10):
+    """
+    Measure the discontinuity in implied vol where the put wing hands over to the call wing.
+
+    WHY THIS MATTERS
+    ----------------
+    Put-call parity says a put and a call at the same strike must carry the same implied
+    volatility. Our smile is built from puts below the forward and calls above it, so if
+    the vendor computed the two sides on a consistent forward and discount curve, the
+    wings should join seamlessly and the combined smile should be smooth through the
+    crossover.
+
+    If instead there is a STEP, the two wings disagree about the level of volatility, and
+    no smooth model curve can fit both. The optimiser is then forced to split the
+    difference, which shows up as a band of same-signed residuals on each side of the
+    forward -- a pattern easily mistaken for the model failing when it is really the data
+    disagreeing with itself.
+
+    TWO MEASURES, AND WHY THE SECOND ONE IS THE TRUSTWORTHY ONE
+    -----------------------------------------------------------
+    The obvious measure extrapolates the put wing to the first call strike and takes the
+    difference. That is `extrapolated_step` below, and it should be read with caution: it
+    depends on how far the extrapolation has to reach and on how curved the smile is over
+    that reach. On our reference date the two strikes nearest the forward (477 and 478)
+    both have CROSSED put quotes -- bid above ask -- so the quality filters remove them and
+    leave a $3 hole exactly at the crossover, in the most curved part of the smile.
+    Extrapolating across that hole gives answers ranging from +0.21 to +0.41 vol points
+    depending on the fit used, which is not a measurement.
+
+    The robust measure is `adjacent_gap`: simply the observed call vol at the first call
+    strike minus the observed put vol at the last put strike, with no fitting at all. Its
+    SIGN is the diagnostic. In this strike region the smile slopes downward, so a
+    consistent smile must show a NEGATIVE gap. A positive one means the two wings disagree
+    badly enough to reverse the local slope of the smile -- a kink pointing the wrong way,
+    which no smooth model can reproduce.
+
+    Inputs:
+        smile (DataFrame): a smile with 'strike', 'market_iv' and 'option_type', sorted
+            ascending by strike.
+        n_strikes (int):   how many put strikes to use for the extrapolated measure.
+
+    Returns:
+        dict with keys:
+            'adjacent_gap'      (float) observed call vol minus observed put vol at the
+                                two strikes either side of the crossover, decimal. The
+                                robust measure -- no fitting.
+            'strike_gap'        (float) dollars between those two strikes. A large value
+                                warns that the crossover is poorly observed.
+            'slope_implied_gap' (float) what the local put-wing slope predicts the gap
+                                should be over that distance, decimal. Comparing this
+                                against 'adjacent_gap' isolates the inconsistency from
+                                the genuine slope of the smile.
+            'extrapolated_step' (float) the fitted measure described above, decimal.
+            'last_put_strike'   (float)
+            'first_call_strike' (float)
+            'extrapolated_vol'  (float) where the put wing was heading, decimal
+            'observed_call_vol' (float) decimal
+        Returns None if either side has too few strikes to measure.
+    """
+    puts = smile.loc[smile["option_type"] == "put"]
+    calls = smile.loc[smile["option_type"] == "call"]
+
+    if len(puts) < 2 or len(calls) < 1:
+        return None
+
+    tail_puts = puts.tail(n_strikes)
+
+    # A straight line is the right extrapolator over the handful of strikes immediately
+    # below the forward: the smile's curvature over a $10 span is negligible compared
+    # with the step we are trying to detect.
+    slope, intercept = np.polyfit(tail_puts["strike"], tail_puts["market_iv"], 1)
+
+    first_call_strike = float(calls["strike"].iloc[0])
+    last_put_strike = float(puts["strike"].iloc[-1])
+    extrapolated_vol = float(slope * first_call_strike + intercept)
+    observed_call_vol = float(calls["market_iv"].iloc[0])
+    observed_put_vol = float(puts["market_iv"].iloc[-1])
+
+    strike_gap = first_call_strike - last_put_strike
+
+    # The LOCAL slope of the put wing, taken from just the last two quotes, tells us how
+    # much of the observed gap is simply the smile sloping. Using two points rather than a
+    # fitted line keeps this measure local, which matters because the smile flattens as it
+    # approaches its minimum and a longer fit would overstate the slope here.
+    if len(puts) >= 2:
+        local_slope = (
+            (puts["market_iv"].iloc[-1] - puts["market_iv"].iloc[-2])
+            / (puts["strike"].iloc[-1] - puts["strike"].iloc[-2])
+        )
+        slope_implied_gap = float(local_slope * strike_gap)
+    else:
+        slope_implied_gap = float("nan")
+
+    return {
+        "adjacent_gap": observed_call_vol - observed_put_vol,
+        "strike_gap": strike_gap,
+        "slope_implied_gap": slope_implied_gap,
+        "extrapolated_step": observed_call_vol - extrapolated_vol,
+        "last_put_strike": last_put_strike,
+        "first_call_strike": first_call_strike,
+        "extrapolated_vol": extrapolated_vol,
+        "observed_call_vol": observed_call_vol,
+    }
+
+
 def validate_price_history(prices, lookback_days=None):
     """
     Check the SPY price series for the defects that would silently corrupt Phase 4.

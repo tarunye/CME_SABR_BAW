@@ -1,0 +1,2 @@
+reference_date,expiry_date,forward,time_to_expiry_years,alpha,beta,rho,nu,rmse_vol_points,max_abs_error_vol_points,n_strikes,calibration_moneyness_band
+2023-12-29,2024-02-16,478.8920167222817,0.13424657534246576,0.1099221105042792,1.0,-0.5108417751863523,2.1038364832195775,0.2945843583083534,0.6378396253349516,103,0.15

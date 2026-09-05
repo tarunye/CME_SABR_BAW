@@ -15,6 +15,7 @@ import pandas as pd
 
 import data_loader
 import plots
+import sabr
 
 
 # ======================================================================================
@@ -68,6 +69,20 @@ CONFIG = {
     "parity_moneyness_band": 0.05,
     "parity_max_spread": 0.30,
 
+    # ---- SABR ------------------------------------------------------------------------
+    # beta is FIXED, not fitted, because it is close to jointly unidentifiable with rho --
+    # both control skew and trade off against each other. 1.0 is the equity index
+    # convention: it makes the forward process lognormal and leaves rho as the sole,
+    # interpretable driver of skew. See the long note in `sabr.calibrate_sabr`.
+    "sabr_beta": 1.0,
+
+    # Only strikes within this fraction of the forward are calibrated to. The full smile
+    # runs from -53% to +20% moneyness, and both extremes are bad fit targets: Hagan's
+    # formula is an ASYMPTOTIC expansion that degrades far from the money, and 35 of the
+    # 151 quoted strikes have a mid below $0.10 with a median relative spread of 40% --
+    # quote noise that would carry equal weight in an unweighted least-squares fit and
+    # drag the at-the-money region off. See the Phase 1 sensitivity table.
+    "calibration_moneyness_band": 0.15,
 }
 
 
@@ -205,6 +220,24 @@ def run_phase_0(config):
     smile.to_csv(smile_table_path, index=False)
     print(f"  Saved table:  {smile_table_path}")
 
+    # Alongside it, one row recording the market state everything else is derived from.
+    # This exists so that `python3 sabr.py` can reconstruct the reference market without
+    # importing main.py, which would make the import graph circular.
+    state_table_path = os.path.join(config["tables_dir"], "reference_market_state.csv")
+    pd.DataFrame([{
+        "reference_date": reference_date,
+        "expiry_date": expiry_date,
+        "spot": spot,
+        "forward": forward,
+        "time_to_expiry_years": time_to_expiry_years,
+        "risk_free_rate": config["risk_free_rate"],
+        "cost_of_carry": forward_result["cost_of_carry"],
+        "implied_dividend_yield": forward_result["implied_dividend_yield"],
+        "sabr_beta": config["sabr_beta"],
+        "calibration_moneyness_band": config["calibration_moneyness_band"],
+    }]).to_csv(state_table_path, index=False)
+    print(f"  Saved table:  {state_table_path}")
+
     return {
         "prices": prices,
         "chain": chain,
@@ -214,6 +247,259 @@ def run_phase_0(config):
         "forward": forward,
         "time_to_expiry_years": time_to_expiry_years,
         "cost_of_carry": forward_result["cost_of_carry"],
+    }
+
+
+def run_phase_1(config, phase_0_results):
+    """
+    Phase 1: calibrate the SABR model to the observed volatility smile.
+
+    Inputs:
+        config (dict):           the CONFIG block above.
+        phase_0_results (dict):  output of `run_phase_0`.
+
+    Returns:
+        dict carrying:
+            'calibration' (dict)      output of `sabr.calibrate_sabr`
+            'fit_smile'   (DataFrame) the strikes actually calibrated to
+    """
+    smile = phase_0_results["smile"]
+    forward = phase_0_results["forward"]
+    time_to_expiry_years = phase_0_results["time_to_expiry_years"]
+    beta = config["sabr_beta"]
+    band = config["calibration_moneyness_band"]
+
+    # ---- Choose the calibration strikes ----------------------------------------------
+    print_section("PHASE 1.1  CALIBRATION RANGE")
+
+    moneyness = smile["strike"] / forward - 1.0
+    fit_smile = smile.loc[moneyness.abs() <= band].reset_index(drop=True)
+
+    print(f"  Full smile             : {len(smile)} strikes, moneyness "
+          f"{moneyness.min():+.1%} to {moneyness.max():+.1%}")
+    print(f"  Calibration band       : |moneyness| <= {band:.0%}")
+    print(f"  Strikes calibrated to  : {len(fit_smile)} "
+          f"(${fit_smile['strike'].min():.0f} to ${fit_smile['strike'].max():.0f})")
+    print(f"  Cheapest quote in band : ${fit_smile['mid'].min():.2f} mid")
+
+    # ---- Fit --------------------------------------------------------------------------
+    print_section("PHASE 1.2  SABR FIT")
+
+    calibration = sabr.calibrate_sabr(
+        strikes=fit_smile["strike"].to_numpy(),
+        market_vols=fit_smile["market_iv"].to_numpy(),
+        forward=forward,
+        time_to_expiry=time_to_expiry_years,
+        beta=beta,
+    )
+
+    sabr.describe_calibration(calibration)
+
+    # ---- Per-strike residuals ---------------------------------------------------------
+    print_section("PHASE 1.3  PER-STRIKE RESIDUALS")
+
+    residual_table = pd.DataFrame({
+        "strike": fit_smile["strike"],
+        "option_type": fit_smile["option_type"],
+        "moneyness": fit_smile["strike"] / forward - 1.0,
+        "market_iv": fit_smile["market_iv"],
+        "sabr_iv": calibration["fitted_vols"],
+        "residual_vol_points": calibration["residuals"] * 100,
+        "mid": fit_smile["mid"],
+    })
+
+    # Print every fifth strike so the table fits on a screen while still spanning the
+    # whole range, then the five largest misses in full.
+    print("  Every 5th strike:")
+    print(residual_table.iloc[::5].to_string(index=False, float_format=lambda x: f"{x:.5f}"))
+
+    worst = residual_table.reindex(
+        residual_table["residual_vol_points"].abs().sort_values(ascending=False).index
+    ).head(5)
+    print()
+    print("  Five largest absolute residuals:")
+    print(worst.to_string(index=False, float_format=lambda x: f"{x:.5f}"))
+
+    # These filenames say "vendor_iv" because Phase 3 supersedes this calibration with one
+    # fitted to volatilities we invert ourselves. Both are kept on disk so the before and
+    # after can be compared, but only Phase 3's writes the unqualified filename that the
+    # rest of the project treats as the answer.
+    residual_path = os.path.join(config["tables_dir"],
+                                 "sabr_fit_diagnostics_vendor_iv.csv")
+    residual_table.to_csv(residual_path, index=False)
+
+    parameter_path = os.path.join(config["tables_dir"], "sabr_calibration_vendor_iv.csv")
+    pd.DataFrame([{
+        "reference_date": config["reference_date"],
+        "expiry_date": config["reference_expiry"],
+        "forward": forward,
+        "time_to_expiry_years": time_to_expiry_years,
+        "alpha": calibration["alpha"],
+        "beta": calibration["beta"],
+        "rho": calibration["rho"],
+        "nu": calibration["nu"],
+        "rmse_vol_points": calibration["rmse"] * 100,
+        "max_abs_error_vol_points": calibration["max_abs_error"] * 100,
+        "n_strikes": calibration["n_strikes"],
+        "calibration_moneyness_band": band,
+    }]).to_csv(parameter_path, index=False)
+
+    # ---- Numerical checks -------------------------------------------------------------
+    print_section("PHASE 1.4  NUMERICAL CHECKS")
+
+    # The at-the-money branch is the one place the formula has an explicit `if`, so it is
+    # the one place a silent step could hide. Confirm the two sides agree, after allowing
+    # for the fact that the smile genuinely slopes.
+    continuity = sabr.check_atm_branch_continuity(
+        forward=forward,
+        time_to_expiry=time_to_expiry_years,
+        alpha=calibration["alpha"],
+        beta=calibration["beta"],
+        rho=calibration["rho"],
+        nu=calibration["nu"],
+    )
+    print(f"  ATM branch continuity  : observed gap {continuity['observed_gap'] * 100:.3e} "
+          f"vol points")
+    print(f"                           explained by genuine skew "
+          f"{continuity['expected_gap'] * 100:.3e}")
+    print(f"                           UNEXPLAINED EXCESS "
+          f"{continuity['excess'] * 100:.3e} vol points  <- must be ~0")
+
+    # A calibrated equity index smile must be downward sloping at the money: that is the
+    # skew, and it is the whole reason we are not using a single Black-Scholes vol.
+    slope_step = forward * 0.01
+    vol_below = sabr.sabr_implied_vol(
+        forward, forward - slope_step, time_to_expiry_years,
+        calibration["alpha"], calibration["beta"], calibration["rho"], calibration["nu"],
+    )
+    vol_above = sabr.sabr_implied_vol(
+        forward, forward + slope_step, time_to_expiry_years,
+        calibration["alpha"], calibration["beta"], calibration["rho"], calibration["nu"],
+    )
+    skew_per_percent = (vol_above - vol_below) / 2.0
+    print(f"  ATM skew               : {skew_per_percent * 100:+.4f} vol points per 1% "
+          f"move in strike")
+    print(f"                           (negative = downward skew, as an equity index "
+          f"should be)")
+
+    # ---- Is the RMSE actually good? --------------------------------------------------
+    # An RMSE means nothing without knowing how clean the data was. Compare it against
+    # the market smile's own strike-to-strike jitter.
+    print()
+    roughness = data_loader.smile_local_roughness(fit_smile)
+    print(f"  DATA NOISE FLOOR (RMS strike-to-strike jitter in the quoted vols):")
+    print(f"    overall              : {roughness['overall'] * 100:.4f} vol points")
+    print(f"    put wing             : {roughness['put'] * 100:.4f} vol points")
+    print(f"    call wing            : {roughness['call'] * 100:.4f} vol points")
+    print(f"    SABR fit RMSE        : {calibration['rmse'] * 100:.4f} vol points")
+
+    # ---- Do the two wings agree with each other? -------------------------------------
+    crossover = data_loader.put_call_crossover_step(fit_smile)
+
+    if crossover is not None:
+        print()
+        print(f"  PUT/CALL CROSSOVER CONSISTENCY:")
+        print(f"    put wing ends at K=${crossover['last_put_strike']:.0f}, "
+              f"call wing starts at K=${crossover['first_call_strike']:.0f}")
+        print(f"    strike gap across crossover: ${crossover['strike_gap']:.0f}")
+        print(f"    ADJACENT GAP (robust)      : "
+              f"{crossover['adjacent_gap'] * 100:+.4f} vol points")
+        print(f"    local slope predicts       : "
+              f"{crossover['slope_implied_gap'] * 100:+.4f} vol points")
+        print(f"    extrapolated step (fragile): "
+              f"{crossover['extrapolated_step'] * 100:+.4f} vol points")
+        print(f"    The smile slopes DOWN here, so a consistent smile needs a NEGATIVE")
+        print(f"    adjacent gap. A positive one reverses the local slope -- a kink no")
+        print(f"    smooth curve can fit. See the per-side fits below.")
+
+    # ---- Fit each wing on its own ----------------------------------------------------
+    # If each wing individually fits to its own noise floor while the combined fit does
+    # not, the residual is the two wings disagreeing, not the model failing.
+    print()
+    print(f"  PER-SIDE FITS (same band, same beta):")
+    print(f"    {'side':>16}  {'strikes':>7}  {'RMSE':>9}  {'rho':>9}")
+
+    for label, side_smile in [
+        ("both wings", fit_smile),
+        ("puts only", fit_smile.loc[fit_smile["option_type"] == "put"]),
+        ("calls only", fit_smile.loc[fit_smile["option_type"] == "call"]),
+    ]:
+        side_fit = sabr.calibrate_sabr(
+            strikes=side_smile["strike"].to_numpy(),
+            market_vols=side_smile["market_iv"].to_numpy(),
+            forward=forward,
+            time_to_expiry=time_to_expiry_years,
+            beta=beta,
+        )
+        print(f"    {label:>16}  {side_fit['n_strikes']:>7d}  "
+              f"{side_fit['rmse'] * 100:>8.4f}  {side_fit['rho']:>+9.4f}")
+
+    # ---- Sensitivity to the two judgement calls --------------------------------------
+    print_section("PHASE 1.5  SENSITIVITY TO THE CALIBRATION CHOICES")
+
+    print("  Fit quality across calibration ranges (beta fixed at "
+          f"{beta:.2f}):")
+    print(f"    {'band':>6}  {'strikes':>7}  {'RMSE':>9}  {'max err':>9}  "
+          f"{'alpha':>8}  {'rho':>9}  {'nu':>7}")
+
+    for trial_band in [0.05, 0.10, 0.15, 0.20, 0.30, 1.00]:
+        trial_smile = smile.loc[moneyness.abs() <= trial_band]
+        trial = sabr.calibrate_sabr(
+            strikes=trial_smile["strike"].to_numpy(),
+            market_vols=trial_smile["market_iv"].to_numpy(),
+            forward=forward,
+            time_to_expiry=time_to_expiry_years,
+            beta=beta,
+        )
+        marker = "  <- chosen" if abs(trial_band - band) < 1e-9 else ""
+        print(f"    {trial_band:>5.0%}  {trial['n_strikes']:>7d}  "
+              f"{trial['rmse'] * 100:>8.4f}  {trial['max_abs_error'] * 100:>8.4f}  "
+              f"{trial['alpha']:>8.4f}  {trial['rho']:>+9.4f}  {trial['nu']:>7.4f}"
+              f"{marker}")
+
+    print()
+    print(f"  Fit quality across beta (band fixed at {band:.0%}):")
+    print(f"    {'beta':>6}  {'RMSE':>9}  {'max err':>9}  {'alpha':>8}  {'rho':>9}  "
+          f"{'nu':>7}")
+
+    for trial_beta in [0.0, 0.3, 0.5, 0.7, 1.0]:
+        trial = sabr.calibrate_sabr(
+            strikes=fit_smile["strike"].to_numpy(),
+            market_vols=fit_smile["market_iv"].to_numpy(),
+            forward=forward,
+            time_to_expiry=time_to_expiry_years,
+            beta=trial_beta,
+        )
+        marker = "  <- chosen" if abs(trial_beta - beta) < 1e-9 else ""
+        print(f"    {trial_beta:>6.2f}  {trial['rmse'] * 100:>8.4f}  "
+              f"{trial['max_abs_error'] * 100:>8.4f}  {trial['alpha']:>8.4f}  "
+              f"{trial['rho']:>+9.4f}  {trial['nu']:>7.4f}{marker}")
+
+    print()
+    print("  Reading: near-identical RMSE across beta is exactly the identification")
+    print("  problem described in `calibrate_sabr` -- rho slides to compensate for beta,")
+    print("  so the data cannot tell them apart. That is why beta is fixed by convention.")
+
+    # ---- Plot -------------------------------------------------------------------------
+    print_section("PHASE 1.6  FIT PLOT")
+
+    plots.plot_sabr_fit(
+        fit_smile=fit_smile,
+        full_smile=smile,
+        calibration=calibration,
+        forward=forward,
+        time_to_expiry=time_to_expiry_years,
+        spot=phase_0_results["spot"],
+        reference_date=config["reference_date"],
+        expiry_date=config["reference_expiry"],
+        output_path=os.path.join(config["figures_dir"], "sabr_fit.png"),
+    )
+    print(f"  Saved table:  {residual_path}")
+    print(f"  Saved table:  {parameter_path}")
+
+    return {
+        "calibration": calibration,
+        "fit_smile": fit_smile,
     }
 
 
@@ -228,9 +514,10 @@ def main():
     print(f"  Reference date : {CONFIG['reference_date']}")
     print(f"  Reference expiry: {CONFIG['reference_expiry']}")
 
-    run_phase_0(CONFIG)
+    phase_0_results = run_phase_0(CONFIG)
+    run_phase_1(CONFIG, phase_0_results)
 
-    print_section("PHASE 0 COMPLETE")
+    print_section("PHASE 1 COMPLETE")
 
 
 if __name__ == "__main__":
