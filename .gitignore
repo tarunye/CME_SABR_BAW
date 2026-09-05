@@ -1,0 +1,31 @@
+# ---------------------------------------------------------------------------
+# Raw vendor data
+# ---------------------------------------------------------------------------
+# The OptionsDX SPY end-of-day option chain files (~600 MB across 2010-2023).
+# Excluded for two reasons: they are far too large for GitHub, and we do not
+# hold redistribution rights. See the "Getting the data" section of README.md
+# for where to download them.
+data/*.parquet
+
+# ---------------------------------------------------------------------------
+# Derived caches
+# ---------------------------------------------------------------------------
+# Everything in data/ that is not a raw parquet file is a cache this project
+# generated from those files. It is reproducible by running the pipeline, so it
+# is not source and does not belong in version control.
+data/*.csv
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---------------------------------------------------------------------------
+# OS and editor noise
+# ---------------------------------------------------------------------------
+.DS_Store
+.ipynb_checkpoints/
