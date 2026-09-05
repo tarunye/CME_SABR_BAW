@@ -103,6 +103,167 @@ def plot_raw_vol_smile(smile, spot, forward, reference_date, expiry_date, output
     print(f"  Saved figure: {output_path}")
 
 
+def plot_reimplied_vs_vendor_vols(comparison, forward, spot, reference_date, expiry_date,
+                                  output_path):
+    """
+    Plot our own BAW-implied volatilities against the vendor's, and their difference.
+
+    The point of the figure is the BOTTOM panel. The vendor's put and call implied vols
+    are mutually inconsistent -- Phase 1 measured a +0.76 vol point step where the put wing
+    hands over to the call wing, which no smooth model can fit. If re-implying both wings
+    ourselves, from mid prices against a single put-call-parity forward and a single
+    American pricer, is the right fix, then the difference between our vols and theirs
+    should not be random noise: it should be a systematic offset that jumps at the money.
+
+    Inputs:
+        comparison (DataFrame): columns 'strike', 'option_type', 'vendor_iv',
+            'reimplied_iv'.
+        forward (float):       forward price, in dollars.
+        spot (float):          spot price, in dollars.
+        reference_date (str):  quote date, for the title.
+        expiry_date (str):     expiry, for the title.
+        output_path (str):     where to write the .png.
+
+    Returns:
+        None. Writes a file to `output_path`.
+    """
+    _ensure_directory(output_path)
+
+    figure, (vol_axes, difference_axes) = plt.subplots(
+        2, 1, figsize=(11, 8), sharex=True, gridspec_kw={"height_ratios": [3, 2]},
+    )
+
+    puts = comparison.loc[comparison["option_type"] == "put"]
+    calls = comparison.loc[comparison["option_type"] == "call"]
+
+    # ---- top panel: the two vol curves ------------------------------------------------
+    vol_axes.scatter(comparison["strike"], comparison["vendor_iv"] * 100, s=26,
+                     facecolors="none", edgecolors="#8c8c8c",
+                     label="Vendor implied vol", zorder=3)
+    vol_axes.scatter(puts["strike"], puts["reimplied_iv"] * 100, s=26, color="#1f77b4",
+                     label="Our BAW-implied vol (OTM puts)", zorder=4)
+    vol_axes.scatter(calls["strike"], calls["reimplied_iv"] * 100, s=26, color="#d62728",
+                     label="Our BAW-implied vol (OTM calls)", zorder=4)
+
+    vol_axes.axvline(forward, color="grey", linestyle=":", linewidth=1.4,
+                     label=f"Forward = ${forward:.2f}", zorder=2)
+    vol_axes.axvline(spot, color="black", linestyle="--", linewidth=1.0,
+                     label=f"Spot = ${spot:.2f}", zorder=2)
+
+    vol_axes.set_ylabel("Implied volatility (%)")
+    vol_axes.set_title(
+        f"Re-implied volatilities vs the vendor's\n"
+        f"Quote date {reference_date}, expiry {expiry_date}  |  "
+        f"inverted from OTM mid prices using BAW and the parity forward"
+    )
+    vol_axes.legend(loc="upper right", frameon=True, fontsize=9)
+    vol_axes.grid(alpha=0.3, zorder=1)
+
+    # ---- bottom panel: the difference --------------------------------------------------
+    difference = (comparison["reimplied_iv"] - comparison["vendor_iv"]) * 100
+
+    difference_axes.axhline(0, color="black", linewidth=1.0, zorder=2)
+    difference_axes.scatter(puts["strike"],
+                            difference.loc[puts.index], s=24, color="#1f77b4",
+                            label="OTM puts", zorder=3)
+    difference_axes.scatter(calls["strike"],
+                            difference.loc[calls.index], s=24, color="#d62728",
+                            label="OTM calls", zorder=3)
+    difference_axes.axvline(forward, color="grey", linestyle=":", linewidth=1.4, zorder=2)
+
+    difference_axes.set_xlabel("Strike ($)")
+    difference_axes.set_ylabel("Ours minus vendor\n(vol points)")
+    difference_axes.legend(loc="upper right", frameon=True, fontsize=9)
+    difference_axes.grid(alpha=0.3, zorder=1)
+
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=FIGURE_DPI)
+    plt.close(figure)
+
+    print(f"  Saved figure: {output_path}")
+
+
+def plot_baw_vs_market_prices(comparison, forward, spot, reference_date, expiry_date,
+                              output_path):
+    """
+    Plot theoretical SABR-plus-BAW option prices against the observed market prices.
+
+    This is the end-to-end check on the whole pricing chain. Everything upstream -- the
+    parity forward, the re-implied vols, the SABR calibration, the BAW pricer -- has to be
+    right for the theoretical prices to land on the market ones.
+
+    The top panel shows both price series with the market bid-ask spread drawn as a shaded
+    band. The band is the standard the model should be judged against: a theoretical price
+    sitting inside the spread is not distinguishable from the market, because there is no
+    single "market price" to be wrong about. The bottom panel shows the pricing error in
+    units of the half-spread, which makes that judgement explicit -- inside +/- 1 means
+    inside the quoted market.
+
+    Inputs:
+        comparison (DataFrame): columns 'strike', 'option_type', 'market_mid',
+            'market_bid', 'market_ask', 'baw_price'.
+        forward (float):       forward price, in dollars.
+        spot (float):          spot price, in dollars.
+        reference_date (str):  quote date, for the title.
+        expiry_date (str):     expiry, for the title.
+        output_path (str):     where to write the .png.
+
+    Returns:
+        None. Writes a file to `output_path`.
+    """
+    _ensure_directory(output_path)
+
+    figure, (price_axes, error_axes) = plt.subplots(
+        2, 1, figsize=(11, 8), sharex=True, gridspec_kw={"height_ratios": [3, 2]},
+    )
+
+    # ---- top panel: prices -------------------------------------------------------------
+    price_axes.fill_between(comparison["strike"], comparison["market_bid"],
+                            comparison["market_ask"], color="#8c8c8c", alpha=0.30,
+                            label="Market bid-ask spread", zorder=2)
+    price_axes.plot(comparison["strike"], comparison["market_mid"], color="#333333",
+                    linewidth=1.2, label="Market mid", zorder=3)
+    price_axes.plot(comparison["strike"], comparison["baw_price"], color="#d62728",
+                    linewidth=1.8, linestyle="--", label="SABR vol -> BAW price", zorder=4)
+
+    price_axes.axvline(forward, color="grey", linestyle=":", linewidth=1.4,
+                       label=f"Forward = ${forward:.2f}", zorder=2)
+
+    # Log scale: option prices across this strike range span three orders of magnitude,
+    # from pennies on the wings to tens of dollars at the money. On a linear axis the
+    # wings would be an indistinguishable flat line along the bottom.
+    price_axes.set_yscale("log")
+    price_axes.set_ylabel("Option price ($, log scale)")
+    price_axes.set_title(
+        f"Theoretical price vs market: SABR volatility fed into the BAW pricer\n"
+        f"Quote date {reference_date}, expiry {expiry_date}, out-of-the-money quotes"
+    )
+    price_axes.legend(loc="upper right", frameon=True, fontsize=9)
+    price_axes.grid(alpha=0.3, which="both", zorder=1)
+
+    # ---- bottom panel: error in half-spreads -------------------------------------------
+    half_spread = (comparison["market_ask"] - comparison["market_bid"]) / 2.0
+    error_in_half_spreads = (comparison["baw_price"] - comparison["market_mid"]) / half_spread
+
+    error_axes.axhspan(-1, 1, color="#2ca02c", alpha=0.15,
+                       label="Inside the bid-ask spread", zorder=2)
+    error_axes.axhline(0, color="black", linewidth=1.0, zorder=3)
+    error_axes.plot(comparison["strike"], error_in_half_spreads, color="#d62728",
+                    marker="o", markersize=3.5, linewidth=1.0, zorder=4)
+    error_axes.axvline(forward, color="grey", linestyle=":", linewidth=1.4, zorder=2)
+
+    error_axes.set_xlabel("Strike ($)")
+    error_axes.set_ylabel("Pricing error\n(half-spreads)")
+    error_axes.legend(loc="upper right", frameon=True, fontsize=9)
+    error_axes.grid(alpha=0.3, zorder=1)
+
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=FIGURE_DPI)
+    plt.close(figure)
+
+    print(f"  Saved figure: {output_path}")
+
+
 def plot_sabr_fit(fit_smile, full_smile, calibration, forward, time_to_expiry, spot,
                   reference_date, expiry_date, output_path):
     """

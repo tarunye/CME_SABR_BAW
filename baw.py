@@ -56,6 +56,7 @@ Run this file directly to print the full validation suite:
 """
 
 import numpy as np
+from scipy.optimize import brentq
 from scipy.stats import norm
 
 
@@ -416,6 +417,145 @@ def baw_price(underlying_price, strike, time_to_expiry, risk_free_rate, cost_of_
         return european + a1 * (underlying_price / critical_price) ** q1
 
     return strike - underlying_price
+
+
+def baw_vega(underlying_price, strike, time_to_expiry, risk_free_rate, cost_of_carry,
+             volatility, option_type, bump=1e-4):
+    """
+    Sensitivity of the BAW price to volatility, per ONE VOLATILITY POINT. Diagnostic only.
+
+    # NOTE (deviation from filing): the filing forbids approximating scenario prices with
+    # a Greeks-based expansion, and this project obeys that -- every scenario in Phase 5 is
+    # a full reprice. This function is NEVER used to produce a price. It exists solely to
+    # ATTRIBUTE errors: to answer "is the gap between our theoretical price and the market
+    # explained by our volatility being slightly off, or by something structurally wrong in
+    # the pricing chain?" Multiplying a volatility error by vega answers that, and the
+    # answer is checked against the observed price error.
+
+    Computed by central finite difference rather than analytically. The analytic vega of
+    the BAW price would have to differentiate through the critical-price solve, and for a
+    diagnostic that costs two extra pricing calls the numerical version is far simpler and
+    accurate to second order.
+
+    Inputs:
+        underlying_price (float):  spot S, in dollars.
+        strike (float):            K, in dollars.
+        time_to_expiry (float):    T, in years.
+        risk_free_rate (float):    r, decimal.
+        cost_of_carry (float):     b, decimal.
+        volatility (float):        sigma at which to evaluate the sensitivity, decimal.
+        option_type (str):         'call' or 'put'.
+        bump (float):              half-width of the central difference, in decimal vol.
+
+    Returns:
+        float: dollars of price change per one volatility POINT (i.e. per 0.01 of decimal
+        volatility), which is how vega is conventionally quoted.
+    """
+    price_up = baw_price(underlying_price, strike, time_to_expiry, risk_free_rate,
+                         cost_of_carry, volatility + bump, option_type)
+    price_down = baw_price(underlying_price, strike, time_to_expiry, risk_free_rate,
+                           cost_of_carry, volatility - bump, option_type)
+
+    # Divide by 100 to convert from "per unit of decimal vol" to "per vol point".
+    return (price_up - price_down) / (2.0 * bump) / 100.0
+
+
+def implied_volatility(market_price, underlying_price, strike, time_to_expiry,
+                       risk_free_rate, cost_of_carry, option_type,
+                       min_volatility=0.001, max_volatility=5.0):
+    """
+    Back out the volatility that makes `baw_price` reproduce an observed market price.
+
+    WHY WE INVERT BAW RATHER THAN BLACK-SCHOLES
+    -------------------------------------------
+    An implied volatility is not an observable. It is whatever number you have to feed a
+    particular model to make it agree with the market. Change the model and the number
+    changes -- so an implied vol is only meaningful alongside the model that produced it.
+
+    SPY options are American, and their market prices contain an early-exercise premium.
+    Inverting a EUROPEAN model on an American price would blame that premium on volatility
+    and return a vol that is too high. Worse, it would do so ASYMMETRICALLY: in our regime
+    `b > r`, so the American call has no premium at all while the American put does. A
+    European inversion would therefore push the put wing up relative to the call wing and
+    manufacture a step at the money -- which is very likely part of what the vendor's own
+    implied vols are doing (see the +0.76 vol point crossover step found in Phase 1).
+
+    Inverting BAW, on the same forward we derived from put-call parity, removes both
+    problems and gives a vol surface that is internally consistent with the pricer we are
+    going to use.
+
+    HOW THE SOLVE WORKS
+    -------------------
+    Option price is strictly increasing in volatility (verified in `check_monotonicity`),
+    so there is exactly one solution and it can be bracketed. We use Brent's method, which
+    is guaranteed to converge given a bracketing interval and needs no derivative.
+
+    Inputs:
+        market_price (float):      the observed price to match, in dollars.
+        underlying_price (float):  spot S, in dollars.
+        strike (float):            K, in dollars.
+        time_to_expiry (float):    T, in years.
+        risk_free_rate (float):    r, decimal.
+        cost_of_carry (float):     b, decimal.
+        option_type (str):         'call' or 'put'.
+        min_volatility (float):    lower end of the search bracket, decimal.
+        max_volatility (float):    upper end of the search bracket, decimal.
+
+    Returns:
+        float: the implied volatility as a decimal, or numpy.nan if the price cannot be
+        matched by any volatility in the bracket. NaN is returned rather than raised
+        because an unmatchable quote is a data-quality fact about one strike, not a
+        program error -- the caller filters those strikes out and reports how many.
+    """
+    _validate_pricing_inputs(underlying_price, strike, time_to_expiry, min_volatility,
+                             option_type)
+
+    if market_price <= 0:
+        return float("nan")
+
+    # An American option that has passed its exercise boundary is worth EXACTLY its
+    # intrinsic value, at any volatility whatsoever. Its price therefore carries no
+    # information about volatility, and asking for its implied vol is not a hard problem
+    # but a meaningless one -- every volatility is a solution.
+    #
+    # We must catch this explicitly. Without the check the bracket test below still passes
+    # (the gap is exactly zero at the floor rather than positive) and the root finder
+    # cheerfully returns the bottom of the search range, which looks like a real answer.
+    # In practice this is why the smile is built from out-of-the-money quotes: those never
+    # sit past the boundary and always carry genuine volatility information.
+    if option_type == "call":
+        intrinsic_value = max(underlying_price - strike, 0.0)
+    else:
+        intrinsic_value = max(strike - underlying_price, 0.0)
+
+    if market_price <= intrinsic_value:
+        return float("nan")
+
+    def price_gap(volatility):
+        """Model price minus market price. We want the volatility that makes this zero."""
+        return baw_price(underlying_price, strike, time_to_expiry, risk_free_rate,
+                         cost_of_carry, volatility, option_type) - market_price
+
+    gap_at_floor = price_gap(min_volatility)
+    gap_at_ceiling = price_gap(max_volatility)
+
+    # We require a STRICT sign change across the bracket. If the gap fails to change sign,
+    # no volatility in the bracket reproduces this price; if it is exactly zero at the
+    # floor, the price is already matched with essentially no volatility at all, which
+    # means the quote carries no volatility information rather than implying a tiny one.
+    #
+    # Three distinct causes, all real in end-of-day data:
+    #   - the quote is BELOW intrinsic value (a stale or crossed market). Even at zero
+    #     volatility the model cannot reach down that far.
+    #   - the option is so deep in the money that N(d1) and N(d2) are both 1.0 to double
+    #     precision. Vega underflows to zero and the price becomes a deterministic
+    #     forward, identical at 5% vol and at 9% vol. Inverting that returns whatever the
+    #     root finder happened to land on, which would look like a real answer.
+    #   - the quote is implausibly high, needing a vol above 500%.
+    if gap_at_floor >= 0 or gap_at_ceiling <= 0:
+        return float("nan")
+
+    return float(brentq(price_gap, min_volatility, max_volatility, xtol=1e-10))
 
 
 def binomial_american_price(underlying_price, strike, time_to_expiry, risk_free_rate,
@@ -1023,6 +1163,85 @@ def check_pnl_error_propagation():
     return True
 
 
+def check_implied_volatility_round_trip(tolerance=1e-4):
+    """
+    Price at a known volatility, invert, and confirm the original volatility comes back.
+
+    This is the only test of `implied_volatility`, and it is a strong one: a round trip
+    exercises the pricer and the inverter together, so an error in either shows up.
+
+    It also pins down the cases that are legitimately NOT invertible. An American option
+    that has passed its exercise boundary is worth exactly its intrinsic value at any
+    volatility, and a deep in-the-money option can have both N(d1) and N(d2) equal to 1.0
+    in double precision, making its price a deterministic forward with zero vega. Neither
+    carries volatility information, and both must return NaN rather than a number that
+    looks real. We assert that every such case is in the money, because our smile is built
+    from out-of-the-money quotes and must never lose a strike to this.
+
+    Inputs:
+        tolerance (float): largest acceptable round-trip error in volatility, decimal.
+
+    Returns:
+        bool: True if every invertible case round-tripped and no OTM case was lost.
+    """
+    print()
+    print("TEST 8: Implied volatility round trip  (price -> invert -> recover the vol)")
+
+    underlying_price = 475.31
+    time_to_expiry = 0.13424657534246576
+    rate = 0.0540
+    carry = 0.055926
+
+    worst_error = 0.0
+    n_inverted = 0
+    not_invertible = []
+
+    for option_type in ["call", "put"]:
+        for strike in [380.0, 400.0, 430.0, 450.0, 460.0, 475.0, 490.0, 500.0, 530.0,
+                       560.0, 600.0]:
+            for vol in [0.05, 0.09, 0.115, 0.20, 0.30, 0.80, 1.50]:
+                price = baw_price(underlying_price, strike, time_to_expiry, rate, carry,
+                                  vol, option_type)
+
+                # Skip strikes the model prices at essentially zero; there is no quote to
+                # invert in reality either.
+                if price < 1e-6:
+                    continue
+
+                recovered = implied_volatility(price, underlying_price, strike,
+                                               time_to_expiry, rate, carry, option_type)
+
+                if np.isnan(recovered):
+                    not_invertible.append((option_type, strike, vol))
+                    continue
+
+                worst_error = max(worst_error, abs(recovered - vol))
+                n_inverted += 1
+
+    # Any strike that could not be inverted must be IN the money. An out-of-the-money
+    # failure would mean losing a real point from the smile.
+    out_of_the_money_failures = [
+        case for case in not_invertible
+        if (case[1] > underlying_price if case[0] == "call" else case[1] < underlying_price)
+    ]
+
+    print(f"  Invertible cases              : {n_inverted}")
+    print(f"  Worst round-trip error        : {worst_error:.3e} vol "
+          f"(tolerance {tolerance:.0e})")
+    print(f"  Correctly returned NaN        : {len(not_invertible)} "
+          f"(price = intrinsic, or vega underflowed)")
+    print(f"  ... of which out-of-the-money : {len(out_of_the_money_failures)} "
+          f"<- must be 0; the smile is built from OTM quotes")
+
+    for case in out_of_the_money_failures[:5]:
+        print(f"    LOST OTM STRIKE: {case[0]} K={case[1]} sigma={case[2]}")
+
+    passed = worst_error < tolerance and not out_of_the_money_failures
+    print(f"  -> {'PASS' if passed else 'FAIL'}")
+
+    return passed
+
+
 def check_monotonicity():
     """
     Prices must move the right way when a single input moves.
@@ -1206,6 +1425,7 @@ def _run_standalone():
         "5. Monotonicity": check_monotonicity(),
         "6. Critical exercise prices": check_critical_prices(),
         "7. SPY reference case": check_spy_reference_case(),
+        "8. Implied volatility round trip": check_implied_volatility_round_trip(),
     }
 
     print()

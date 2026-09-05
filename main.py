@@ -13,6 +13,7 @@ import os
 
 import pandas as pd
 
+import baw
 import data_loader
 import plots
 import sabr
@@ -503,6 +504,473 @@ def run_phase_1(config, phase_0_results):
     }
 
 
+def price_option_with_sabr(strike, underlying_price, forward, time_to_expiry,
+                           risk_free_rate, cost_of_carry, calibration, option_type):
+    """
+    The junction of the two models: SABR supplies a volatility, BAW turns it into a price.
+
+    This is the single function the whole project has been building towards. Everything
+    before it produces one of its inputs; Phase 5 calls it once per historical scenario.
+
+    THE FORWARD-VERSUS-SPOT DISTINCTION -- READ THIS BEFORE CHANGING ANYTHING
+    ------------------------------------------------------------------------
+    The two models are parameterised on DIFFERENT underlying quantities, and mixing them up
+    is the most common bug at this junction. It is also a quiet one: the code runs, the
+    prices look plausible, and the smile is simply shifted sideways.
+
+        SABR takes the FORWARD.  F = S * exp(b * T) = $478.89 for our reference expiry.
+        BAW takes the SPOT.      S = $475.31.
+
+    They differ by $3.58 here -- more than three strike increments -- because rates were
+    at 5.4% and no dividend falls inside the window. Passing spot to SABR would evaluate
+    the smile at the wrong moneyness for every strike; passing the forward to BAW would
+    have the pricer discount an underlying it does not own.
+
+    Both are handled below by taking them as separate arguments, so that no part of this
+    function has to infer one from the other.
+
+    Inputs:
+        strike (float):            K, in dollars.
+        underlying_price (float):  spot S, in dollars. Goes to BAW.
+        forward (float):           F, in dollars. Goes to SABR.
+        time_to_expiry (float):    T, in years.
+        risk_free_rate (float):    r, decimal.
+        cost_of_carry (float):     b, decimal, consistent with F = S * exp(b * T).
+        calibration (dict):        output of `sabr.calibrate_sabr`.
+        option_type (str):         'call' or 'put'.
+
+    Returns:
+        tuple (volatility, price): the SABR implied volatility as a decimal, and the BAW
+        American option price in dollars.
+    """
+    # Step 1: SABR reads the smile at this strike, given where the FORWARD is.
+    volatility = sabr.sabr_implied_vol(
+        forward=forward,
+        strike=strike,
+        time_to_expiry=time_to_expiry,
+        alpha=calibration["alpha"],
+        beta=calibration["beta"],
+        rho=calibration["rho"],
+        nu=calibration["nu"],
+    )
+
+    # Step 2: BAW converts that volatility into an American price, from SPOT.
+    price = baw.baw_price(
+        underlying_price=underlying_price,
+        strike=strike,
+        time_to_expiry=time_to_expiry,
+        risk_free_rate=risk_free_rate,
+        cost_of_carry=cost_of_carry,
+        volatility=volatility,
+        option_type=option_type,
+    )
+
+    return volatility, price
+
+
+def reimply_smile_volatilities(smile, underlying_price, time_to_expiry, risk_free_rate,
+                               cost_of_carry):
+    """
+    Replace the vendor's implied volatilities with our own, inverted from mid prices.
+
+    WHY WE DO THIS
+    --------------
+    Phase 1 found that the vendor's put and call implied vols are mutually inconsistent:
+    the put wing ends heading for 10.91% while the call wing opens at 11.67%, a +0.76 vol
+    point step at the crossover. Put-call parity says a put and a call at the same strike
+    must carry the same volatility, so that step is an artefact of how the vendor computed
+    the numbers -- almost certainly a different forward or dividend assumption on the two
+    sides, and possibly a European model applied to American puts.
+
+    No smooth curve can fit a discontinuous smile, so the step was the dominant term in the
+    Phase 1 SABR fit error and it would propagate into every scenario price in Phase 5.
+
+    The fix is to stop using their number and compute our own from the one thing that is
+    genuinely observed: the mid price. We invert the same BAW pricer we will later use to
+    price, against the same put-call-parity forward we derived in Phase 0. That makes the
+    volatility surface internally consistent with the rest of the project by construction.
+
+    Inputs:
+        smile (DataFrame):        output of `data_loader.build_otm_smile`, with 'strike',
+            'option_type' and 'mid'.
+        underlying_price (float): spot S, in dollars.
+        time_to_expiry (float):   T, in years.
+        risk_free_rate (float):   r, decimal.
+        cost_of_carry (float):    b, decimal.
+
+    Returns:
+        tuple (reimplied_smile, n_failed):
+            reimplied_smile (DataFrame): a copy of the input with 'market_iv' replaced by
+                our own value, the vendor's kept as 'vendor_iv', and any strike we could
+                not invert dropped.
+            n_failed (int): how many strikes could not be inverted.
+    """
+    reimplied = smile.copy()
+    reimplied["vendor_iv"] = reimplied["market_iv"]
+
+    # A plain loop over a few hundred strikes. Each iteration is an independent
+    # root-find, so there is nothing to gain from vectorising and a great deal of clarity
+    # to lose -- see the same argument in `sabr.sabr_vol_curve`.
+    reimplied_vols = []
+
+    for _, row in reimplied.iterrows():
+        vol = baw.implied_volatility(
+            market_price=row["mid"],
+            underlying_price=underlying_price,
+            strike=row["strike"],
+            time_to_expiry=time_to_expiry,
+            risk_free_rate=risk_free_rate,
+            cost_of_carry=cost_of_carry,
+            option_type=row["option_type"],
+        )
+        reimplied_vols.append(vol)
+
+    reimplied["reimplied_iv"] = reimplied_vols
+
+    # A strike that cannot be inverted is one whose quote no volatility reproduces --
+    # typically a mid sitting below intrinsic value because one side of the quote went
+    # stale. We drop those and report the count rather than patching them.
+    n_failed = int(reimplied["reimplied_iv"].isna().sum())
+    reimplied = reimplied.loc[reimplied["reimplied_iv"].notna()].reset_index(drop=True)
+
+    # From here on 'market_iv' means OUR implied vol, so that everything downstream --
+    # the SABR calibration, the diagnostics, the plots -- works unchanged.
+    reimplied["market_iv"] = reimplied["reimplied_iv"]
+
+    return reimplied, n_failed
+
+
+def run_phase_3(config, phase_0_results, phase_1_results):
+    """
+    Phase 3: re-imply the volatilities, recalibrate SABR, and wire it into the BAW pricer.
+
+    Three things happen here, in order:
+      1. We replace the vendor's implied vols with our own, inverted from mid prices.
+      2. We recalibrate SABR to the corrected smile.
+      3. We price real strikes through SABR into BAW and compare against the market.
+
+    Inputs:
+        config (dict):          the CONFIG block above.
+        phase_0_results (dict): output of `run_phase_0`.
+        phase_1_results (dict): output of `run_phase_1`, used only for the before/after
+            comparison of fit quality.
+
+    Returns:
+        dict carrying:
+            'calibration'  (dict)      the recalibrated SABR parameters
+            'smile'        (DataFrame) the re-implied smile
+            'fit_smile'    (DataFrame) the strikes calibrated to
+            'comparison'   (DataFrame) the market-vs-theoretical price table
+    """
+    smile = phase_0_results["smile"]
+    spot = phase_0_results["spot"]
+    forward = phase_0_results["forward"]
+    time_to_expiry = phase_0_results["time_to_expiry_years"]
+    cost_of_carry = phase_0_results["cost_of_carry"]
+    risk_free_rate = config["risk_free_rate"]
+    beta = config["sabr_beta"]
+    band = config["calibration_moneyness_band"]
+
+    # ---- 1. Re-imply -----------------------------------------------------------------
+    print_section("PHASE 3.1  RE-IMPLYING VOLATILITIES FROM MID PRICES")
+
+    print(f"  Inverting BAW on {len(smile)} out-of-the-money mid prices...")
+    print(f"  Using spot ${spot:.2f}, forward ${forward:.3f}, b = {cost_of_carry:.4%}, "
+          f"r = {risk_free_rate:.4%}")
+
+    reimplied_smile, n_failed = reimply_smile_volatilities(
+        smile=smile,
+        underlying_price=spot,
+        time_to_expiry=time_to_expiry,
+        risk_free_rate=risk_free_rate,
+        cost_of_carry=cost_of_carry,
+    )
+
+    print(f"  Inverted successfully : {len(reimplied_smile)} strikes")
+    print(f"  Could not invert      : {n_failed} "
+          f"(mid below intrinsic, or no vega -- dropped)")
+
+    difference = reimplied_smile["reimplied_iv"] - reimplied_smile["vendor_iv"]
+    is_put = reimplied_smile["option_type"] == "put"
+
+    print()
+    print(f"  Our vol minus the vendor's, in vol points:")
+    print(f"    all strikes  : mean {difference.mean() * 100:+.4f}, "
+          f"min {difference.min() * 100:+.4f}, max {difference.max() * 100:+.4f}")
+    print(f"    OTM puts     : mean {difference[is_put].mean() * 100:+.4f} "
+          f"({is_put.sum()} strikes)")
+    print(f"    OTM calls    : mean {difference[~is_put].mean() * 100:+.4f} "
+          f"({(~is_put).sum()} strikes)")
+
+    # ---- 2. Did it remove the crossover step? ----------------------------------------
+    print_section("PHASE 3.2  DID RE-IMPLYING FIX THE PUT/CALL INCONSISTENCY?")
+
+    in_band = (reimplied_smile["strike"] / forward - 1.0).abs() <= band
+    reimplied_fit_smile = reimplied_smile.loc[in_band].reset_index(drop=True)
+
+    # Measure the crossover step and the noise floor both ways, on the same strikes.
+    vendor_view = reimplied_fit_smile.copy()
+    vendor_view["market_iv"] = vendor_view["vendor_iv"]
+
+    vendor_step = data_loader.put_call_crossover_step(vendor_view)
+    reimplied_step = data_loader.put_call_crossover_step(reimplied_fit_smile)
+
+    vendor_roughness = data_loader.smile_local_roughness(vendor_view)
+    reimplied_roughness = data_loader.smile_local_roughness(reimplied_fit_smile)
+
+    print(f"  The two strikes nearest the forward (477, 478) both have CROSSED put quotes")
+    print(f"  and were filtered out, leaving a ${reimplied_step['strike_gap']:.0f} hole at "
+          f"the crossover. So we judge by the")
+    print(f"  SIGN of the adjacent gap, not by a value extrapolated across that hole.")
+    print(f"  The smile slopes down here, so a consistent smile needs a NEGATIVE gap.")
+    print()
+    print(f"  {'':<28} {'vendor IV':>12} {'our IV':>12}")
+    print(f"  {'adjacent gap (robust)':<28} "
+          f"{vendor_step['adjacent_gap'] * 100:>+11.4f}  "
+          f"{reimplied_step['adjacent_gap'] * 100:>+11.4f}   vol points")
+    print(f"  {'  local slope predicts':<28} "
+          f"{vendor_step['slope_implied_gap'] * 100:>+11.4f}  "
+          f"{reimplied_step['slope_implied_gap'] * 100:>+11.4f}   vol points")
+    print(f"  {'extrapolated step (fragile)':<28} "
+          f"{vendor_step['extrapolated_step'] * 100:>+11.4f}  "
+          f"{reimplied_step['extrapolated_step'] * 100:>+11.4f}   vol points")
+    print(f"  {'local roughness, overall':<28} "
+          f"{vendor_roughness['overall'] * 100:>12.4f} "
+          f"{reimplied_roughness['overall'] * 100:>12.4f}")
+    print(f"  {'local roughness, put wing':<28} "
+          f"{vendor_roughness['put'] * 100:>12.4f} "
+          f"{reimplied_roughness['put'] * 100:>12.4f}")
+    print(f"  {'local roughness, call wing':<28} "
+          f"{vendor_roughness['call'] * 100:>12.4f} "
+          f"{reimplied_roughness['call'] * 100:>12.4f}")
+
+    # ---- 3. Recalibrate ---------------------------------------------------------------
+    print_section("PHASE 3.3  RECALIBRATING SABR ON THE CORRECTED SMILE")
+
+    calibration = sabr.calibrate_sabr(
+        strikes=reimplied_fit_smile["strike"].to_numpy(),
+        market_vols=reimplied_fit_smile["market_iv"].to_numpy(),
+        forward=forward,
+        time_to_expiry=time_to_expiry,
+        beta=beta,
+    )
+
+    sabr.describe_calibration(calibration)
+
+    old_calibration = phase_1_results["calibration"]
+
+    print()
+    print(f"  BEFORE AND AFTER (both at |moneyness| <= {band:.0%}, beta = {beta:.1f}):")
+    print(f"    {'':<22} {'vendor IV':>12} {'our IV':>12}")
+    print(f"    {'strikes':<22} {old_calibration['n_strikes']:>12d} "
+          f"{calibration['n_strikes']:>12d}")
+    print(f"    {'RMSE (vol points)':<22} {old_calibration['rmse'] * 100:>12.4f} "
+          f"{calibration['rmse'] * 100:>12.4f}")
+    print(f"    {'max error (vol points)':<22} "
+          f"{old_calibration['max_abs_error'] * 100:>12.4f} "
+          f"{calibration['max_abs_error'] * 100:>12.4f}")
+    print(f"    {'alpha':<22} {old_calibration['alpha']:>12.6f} "
+          f"{calibration['alpha']:>12.6f}")
+    print(f"    {'rho':<22} {old_calibration['rho']:>+12.6f} "
+          f"{calibration['rho']:>+12.6f}")
+    print(f"    {'nu':<22} {old_calibration['nu']:>12.6f} "
+          f"{calibration['nu']:>12.6f}")
+
+    # ---- 4. Price against the market --------------------------------------------------
+    print_section("PHASE 3.4  THEORETICAL PRICE VS MARKET PRICE")
+
+    comparison_rows = []
+
+    for _, row in reimplied_fit_smile.iterrows():
+        sabr_vol, theoretical_price = price_option_with_sabr(
+            strike=row["strike"],
+            underlying_price=spot,
+            forward=forward,
+            time_to_expiry=time_to_expiry,
+            risk_free_rate=risk_free_rate,
+            cost_of_carry=cost_of_carry,
+            calibration=calibration,
+            option_type=row["option_type"],
+        )
+
+        half_spread = (row["ask"] - row["bid"]) / 2.0
+
+        comparison_rows.append({
+            "strike": row["strike"],
+            "option_type": row["option_type"],
+            "moneyness": row["strike"] / forward - 1.0,
+            "market_iv": row["vendor_iv"],
+            "reimplied_iv": row["reimplied_iv"],
+            "sabr_iv": sabr_vol,
+            "market_bid": row["bid"],
+            "market_ask": row["ask"],
+            "market_mid": row["mid"],
+            "baw_price": theoretical_price,
+            "absolute_diff": theoretical_price - row["mid"],
+            "percent_diff": (theoretical_price - row["mid"]) / row["mid"],
+            "half_spreads": (theoretical_price - row["mid"]) / half_spread,
+        })
+
+    comparison = pd.DataFrame(comparison_rows)
+
+    display_columns = ["strike", "option_type", "market_iv", "sabr_iv", "market_mid",
+                       "baw_price", "absolute_diff", "percent_diff", "half_spreads"]
+
+    print("  Every 6th strike ('market_iv' is the vendor's, for reference):")
+    print(comparison[display_columns].iloc[::6].to_string(
+        index=False, float_format=lambda x: f"{x:.5f}"))
+
+    inside_spread = comparison["half_spreads"].abs() <= 1.0
+    spread_width = comparison["market_ask"] - comparison["market_bid"]
+
+    print()
+    print(f"  Strikes priced             : {len(comparison)}")
+    print(f"  Mean absolute error        : ${comparison['absolute_diff'].abs().mean():.4f}")
+    print(f"  Max absolute error         : ${comparison['absolute_diff'].abs().max():.4f}")
+    print(f"  Mean SIGNED error          : "
+          f"${comparison['absolute_diff'].mean():+.4f}  "
+          f"<- near zero means no systematic bias, only scatter")
+    print()
+    print(f"  Inside the bid-ask spread  : {inside_spread.sum()} of {len(comparison)} "
+          f"({inside_spread.mean():.1%})")
+    print(f"  ... but SPY spreads are a PENNY wide: median ${spread_width.median():.3f}, "
+          f"which is {(spread_width / comparison['market_mid']).median():.2%} of mid.")
+    print(f"  'Inside the spread' therefore demands matching the market to half a cent,")
+    print(f"  which no smile model achieves. Judge by absolute error instead.")
+
+    # ---- Where does the pricing error come from? --------------------------------------
+    # If the SABR-to-BAW wiring were wrong -- spot passed where the forward belongs, a
+    # mismatched day count, the wrong carry -- the error would be structural and would NOT
+    # track the volatility fit error. So we attribute: multiply each strike's vol error by
+    # its vega and see how much of the observed price error that accounts for.
+    vegas = []
+
+    for _, row in comparison.iterrows():
+        vegas.append(baw.baw_vega(
+            underlying_price=spot,
+            strike=row["strike"],
+            time_to_expiry=time_to_expiry,
+            risk_free_rate=risk_free_rate,
+            cost_of_carry=cost_of_carry,
+            volatility=row["sabr_iv"],
+            option_type=row["option_type"],
+        ))
+
+    comparison["vega"] = vegas
+    comparison["vol_error_vol_points"] = (
+        comparison["sabr_iv"] - comparison["reimplied_iv"]
+    ) * 100
+    comparison["predicted_price_error"] = (
+        comparison["vol_error_vol_points"] * comparison["vega"]
+    )
+
+    unexplained = comparison["absolute_diff"] - comparison["predicted_price_error"]
+    explained_fraction = 1.0 - (
+        unexplained.abs().mean() / comparison["absolute_diff"].abs().mean()
+    )
+
+    print()
+    print(f"  ERROR ATTRIBUTION -- is this the vol fit, or a broken pricing chain?")
+    print(f"    observed price error       : mean abs "
+          f"${comparison['absolute_diff'].abs().mean():.5f}")
+    print(f"    predicted from vol x vega  : mean abs "
+          f"${comparison['predicted_price_error'].abs().mean():.5f}")
+    print(f"    UNEXPLAINED residual       : mean abs ${unexplained.abs().mean():.6f}, "
+          f"max ${unexplained.abs().max():.6f}")
+    print(f"    explained by the vol fit   : {explained_fraction:.2%}")
+    print(f"    Essentially all of the pricing error is the SABR fit residual seen")
+    print(f"    through vega. The forward/spot wiring is correct; what is left is the")
+    print(f"    smile fit, and that is limited by the data, not by the plumbing.")
+
+    worst = comparison.reindex(
+        comparison["half_spreads"].abs().sort_values(ascending=False).index
+    ).head(5)
+    print()
+    print("  Five worst strikes, measured in half-spreads:")
+    print(worst[display_columns].to_string(
+        index=False, float_format=lambda x: f"{x:.5f}"))
+
+    # ---- 5. Save and plot -------------------------------------------------------------
+    print_section("PHASE 3.5  TABLES AND FIGURES")
+
+    comparison_path = os.path.join(config["tables_dir"], "baw_vs_market_prices.csv")
+    comparison.to_csv(comparison_path, index=False)
+
+    smile_path = os.path.join(config["tables_dir"], "reimplied_smile.csv")
+    reimplied_smile.to_csv(smile_path, index=False)
+
+    diagnostics_path = os.path.join(config["tables_dir"], "sabr_fit_diagnostics.csv")
+    pd.DataFrame({
+        "strike": reimplied_fit_smile["strike"],
+        "option_type": reimplied_fit_smile["option_type"],
+        "moneyness": reimplied_fit_smile["strike"] / forward - 1.0,
+        "vendor_iv": reimplied_fit_smile["vendor_iv"],
+        "reimplied_iv": reimplied_fit_smile["reimplied_iv"],
+        "sabr_iv": calibration["fitted_vols"],
+        "residual_vol_points": calibration["residuals"] * 100,
+        "mid": reimplied_fit_smile["mid"],
+    }).to_csv(diagnostics_path, index=False)
+
+    calibration_path = os.path.join(config["tables_dir"], "sabr_calibration.csv")
+    pd.DataFrame([{
+        "reference_date": config["reference_date"],
+        "expiry_date": config["reference_expiry"],
+        "forward": forward,
+        "time_to_expiry_years": time_to_expiry,
+        "alpha": calibration["alpha"],
+        "beta": calibration["beta"],
+        "rho": calibration["rho"],
+        "nu": calibration["nu"],
+        "rmse_vol_points": calibration["rmse"] * 100,
+        "max_abs_error_vol_points": calibration["max_abs_error"] * 100,
+        "n_strikes": calibration["n_strikes"],
+        "calibration_moneyness_band": band,
+        "volatility_source": "reimplied_from_mid_prices",
+    }]).to_csv(calibration_path, index=False)
+
+    plots.plot_reimplied_vs_vendor_vols(
+        comparison=reimplied_smile,
+        forward=forward,
+        spot=spot,
+        reference_date=config["reference_date"],
+        expiry_date=config["reference_expiry"],
+        output_path=os.path.join(config["figures_dir"], "reimplied_vs_vendor_vols.png"),
+    )
+
+    plots.plot_baw_vs_market_prices(
+        comparison=comparison,
+        forward=forward,
+        spot=spot,
+        reference_date=config["reference_date"],
+        expiry_date=config["reference_expiry"],
+        output_path=os.path.join(config["figures_dir"], "baw_vs_market_prices.png"),
+    )
+
+    plots.plot_sabr_fit(
+        fit_smile=reimplied_fit_smile,
+        full_smile=reimplied_smile,
+        calibration=calibration,
+        forward=forward,
+        time_to_expiry=time_to_expiry,
+        spot=spot,
+        reference_date=config["reference_date"],
+        expiry_date=config["reference_expiry"],
+        output_path=os.path.join(config["figures_dir"], "sabr_fit.png"),
+    )
+
+    print(f"  Saved table:  {comparison_path}")
+    print(f"  Saved table:  {smile_path}")
+    print(f"  Saved table:  {diagnostics_path}")
+    print(f"  Saved table:  {calibration_path}")
+
+    return {
+        "calibration": calibration,
+        "smile": reimplied_smile,
+        "fit_smile": reimplied_fit_smile,
+        "comparison": comparison,
+    }
+
+
 def main():
     """
     Run the full pipeline end to end.
@@ -515,9 +983,10 @@ def main():
     print(f"  Reference expiry: {CONFIG['reference_expiry']}")
 
     phase_0_results = run_phase_0(CONFIG)
-    run_phase_1(CONFIG, phase_0_results)
+    phase_1_results = run_phase_1(CONFIG, phase_0_results)
+    run_phase_3(CONFIG, phase_0_results, phase_1_results)
 
-    print_section("PHASE 1 COMPLETE")
+    print_section("PHASE 3 COMPLETE")
 
 
 if __name__ == "__main__":

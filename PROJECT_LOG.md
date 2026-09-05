@@ -4,7 +4,7 @@ Running record of what has been built, decided, and deferred. Append-only: each 
 a section, nothing earlier gets rewritten. If you are picking this project up cold, read
 this file top to bottom and you will know exactly where things stand.
 
-**Current status: Phase 2 complete. Awaiting approval for Phase 3.**
+**Current status: Phase 3 complete. Awaiting approval for Phase 4.**
 
 ---
 
@@ -375,6 +375,151 @@ properties — not by tests 4/4b, which measure the accuracy of the *method*.
 3. **`T <= 0` and `sigma <= 0` raise rather than returning intrinsic value.** Both have
    well-defined limits, but silently returning them would hide a caller feeding an expired
    option into a pricing loop.
+
+---
+
+## PHASE 3 — Wire SABR into BAW, and re-imply the volatilities ✅ complete, awaiting approval
+
+### What was built
+
+- `baw.implied_volatility` — inverts `baw_price` by Brent's method to recover the vol that
+  reproduces an observed price. Returns NaN, not a number, for quotes no vol can match.
+- `baw.baw_vega` — finite-difference vega. **Diagnostic only, never used to price** (the
+  filing forbids Greeks-based approximation of scenario prices).
+- `main.price_option_with_sabr` — the junction: SABR supplies the vol, BAW turns it into a
+  price. Placed in `main.py` deliberately, so `baw.py` keeps no SABR dependency and stays
+  testable in isolation with volatility as a plain input argument.
+- `main.reimply_smile_volatilities` — replaces the vendor's IVs with our own.
+- `plots.plot_reimplied_vs_vendor_vols`, `plots.plot_baw_vs_market_prices`.
+- `baw.py` test 8: implied-volatility round trip.
+
+### Re-implying the volatilities worked
+
+All 151 OTM strikes inverted, none failed. Our vols minus the vendor's:
+
+| | Mean difference (vol points) |
+|---|---|
+| OTM puts (112) | **+0.1231** |
+| OTM calls (39) | **−0.0911** |
+
+The difference is a systematic offset that jumps sign at the forward, not random noise —
+visible directly in the lower panel of `reimplied_vs_vendor_vols.png`. That is the
+signature of a structural inconsistency in the vendor's numbers, exactly as diagnosed.
+
+**The decisive evidence is the sign of the crossover gap.** The smile slopes *down* through
+this strike region, so a self-consistent smile must show a *negative* gap going from the
+last put to the first call:
+
+| | Last put K=476 | First call K=479 | Adjacent gap |
+|---|---|---|---|
+| Vendor IV | 11.379% | 11.670% | **+0.291** ← wrong sign |
+| Our IV | 11.567% | 11.358% | **−0.209** ← correct sign |
+
+The vendor's smile had a kink pointing the wrong way, which no smooth curve can fit. Ours
+is monotone through the crossover.
+
+Fit quality, before and after:
+
+| | Vendor IV | Our IV |
+|---|---|---|
+| SABR RMSE (vol points) | 0.2946 | **0.2346** |
+| Max error (vol points) | 0.6378 | **0.5075** |
+| Local roughness, put wing | 0.0501 | **0.0320** |
+| Local roughness, call wing | 0.1851 | 0.1813 |
+| `alpha` | 0.109922 | 0.109797 |
+| `rho` | −0.510842 | −0.524225 |
+| `nu` | 2.103836 | 2.132810 |
+
+### A measurement error of mine, corrected
+
+Phase 1 reported a "+0.76 vol point put/call step" from a linear extrapolation of the put
+wing across the crossover. That number is **not trustworthy**, and Phase 3 found out why:
+the two strikes nearest the forward, 477 and 478, both have **crossed put quotes** (bid
+7.36 / ask 7.33 and bid 7.78 / ask 7.77), so the quality filters drop them and leave a $3
+hole exactly at the crossover, in the most curved part of the smile. Extrapolating across
+it gives anything from +0.21 to +0.41 vol points depending on the fit used.
+
+`data_loader.put_call_crossover_step` now returns the robust `adjacent_gap` (no fitting at
+all) alongside the fragile `extrapolated_step`, and the phase output says which to trust.
+The Phase 1 conclusion — that the wings were inconsistent — was correct; the precise
+magnitude was not.
+
+### Why the residual gap is not the forward
+
+I checked whether the residual could be closed by moving the forward. It is very sensitive
+to it: the step crosses zero near F ≈ $479.6, about $0.70 above our parity forward of
+$478.892 — 3.5 standard deviations of the parity estimate, so not noise.
+
+I then tested the mechanism I had flagged in Phase 0 note #3: European parity applied to
+American options biases the implied forward down by the put's early-exercise premium.
+De-Americanising the parity calculation (subtracting each leg's early-exercise premium
+before applying parity; the call premium is exactly zero here since `b > r`) moves the
+forward from $478.892 to **$479.036, only +$0.144** — about 20% of the gap. So the
+early-exercise bias is real and in the right direction, but it is *not* the main cause.
+The remainder is most likely that the parity forward is computed from both legs, one of
+which is always the illiquid in-the-money one. Left as-is and documented.
+
+### The SABR→BAW junction is provably correct
+
+103 strikes priced through SABR into BAW against the market:
+
+- Mean absolute error **$0.0718**, max **$0.3373**
+- Mean **signed** error **−$0.0007** — no systematic bias, only scatter
+
+Only 6 of 103 (5.8%) land inside the bid-ask spread, which looks alarming until you look
+at the spreads: **SPY option spreads here are a single penny** (median $0.010, 0.94% of
+mid). "Inside the spread" demands matching the market to half a cent, which no smile model
+achieves. Absolute error is the meaningful measure.
+
+The important test is error attribution. If the wiring were wrong — spot passed where the
+forward belongs, a mismatched day count, the wrong carry — the error would be structural
+and would not track the volatility fit error. Multiplying each strike's vol error by its
+vega:
+
+| | Mean absolute |
+|---|---|
+| Observed price error | $0.07177 |
+| Predicted from vol error × vega | $0.07182 |
+| **Unexplained residual** | **$0.000567** (max $0.003516) |
+
+**99.21% of the pricing error is the SABR fit residual seen through vega**, correlation
+0.999974. The forward/spot handling is correct; what remains is the smile fit, and that is
+limited by the data rather than by the plumbing.
+
+### Two bugs found and fixed in `baw.py`
+
+Both were surfaced by the inverter probing regions the pricer had never been asked about:
+
+1. **Put critical-price seed overflowed at low volatility.** As σ → 0 the perpetual put
+   boundary collapses onto the strike, the denominator `(K − S_perpetual)` goes to zero,
+   `h1` blows up to +∞ and `exp(h1)` overflows to NaN. Fixed by clamping `h1` at zero,
+   which is exactly the correct limit: with no volatility there is no reason to wait, so
+   the exercise boundary *is* the strike.
+2. **Newton-Raphson diverged to a negative critical price** for deep in-the-money puts at
+   high volatility, after which the `log` in `d1` poisoned every subsequent iterate. Fixed
+   by clamping each iterate into the region where the boundary can economically lie — above
+   K for a call, in (0, K) for a put.
+
+Also added: `solve_critical_price` now raises a clear error when called for a call with
+`b >= r`, where no finite boundary exists, instead of exhausting its iteration cap and
+reporting a misleading convergence failure.
+
+### Two things `implied_volatility` must refuse to answer
+
+Both return NaN rather than a plausible-looking number, and test 8 asserts that no
+out-of-the-money strike ever hits either:
+
+- An option **past its exercise boundary** is worth exactly its intrinsic value at any
+  volatility. Every vol is a solution, so none is.
+- A **deep in-the-money** option can have `N(d1)` and `N(d2)` both equal to 1.0 in double
+  precision. Vega underflows, the price becomes a deterministic forward — bit-identical at
+  5% and 9% vol — and the root finder would return wherever it happened to land.
+
+### Housekeeping
+
+`sabr.py` standalone now prefers `reimplied_smile.csv` when it exists, so `python3 sabr.py`
+reports the same parameters as `python3 main.py` rather than the superseded vendor-IV ones.
+Phase 1's tables were renamed to `*_vendor_iv.csv` so they cannot be confused with Phase 3's.
 
 ---
 
