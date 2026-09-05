@@ -1,0 +1,16 @@
+# Pinned to the versions this project was developed and verified against.
+#
+# Install with:
+#     pip install -r requirements.txt
+#
+# Developed on Python 3.11.5. Nothing here uses a feature newer than 3.9, but the pins
+# below are what the results in outputs/ were produced with.
+
+numpy==1.26.4
+pandas==2.2.0
+scipy==1.15.3
+matplotlib==3.10.3
+
+# Reads the raw data/spy_eod_YYYY.parquet vendor files. Required by pandas.read_parquet;
+# pandas does not pull a parquet engine in on its own.
+pyarrow==19.0.1

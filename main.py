@@ -1997,6 +1997,189 @@ def run_phase_6(config, phase_5_results):
     }
 
 
+def build_summary_rows(config, phase_0_results, phase_3_results, phase_4_results,
+                       phase_5_results, phase_6_results):
+    """
+    Assemble the headline results as label/value pairs for the summary table image.
+
+    Everything a reader needs to understand what was measured and what came out, in one
+    place: the position, the market state it was priced in, the calibrated model, the
+    result, and the two caveats that most affect how the number should be read.
+
+    Inputs:
+        config (dict):          the CONFIG block above.
+        phase_0_results (dict), phase_3_results (dict), phase_4_results (dict),
+        phase_5_results (dict), phase_6_results (dict): the phase outputs.
+
+    Returns:
+        list of (label, value) string pairs. A pair whose value is "" is a section heading.
+    """
+    position = phase_5_results["position"]
+    calibration = phase_3_results["calibration"]
+    var_result = phase_6_results["var_result"]
+    stress_var_result = phase_6_results["stress_var_result"]
+    statistics = phase_4_results["statistics"]
+    revaluation = phase_5_results["revaluation"]
+    base_price = phase_5_results["base_price"]
+
+    position_value = position["quantity"] * base_price
+
+    market_row = phase_3_results["comparison"].loc[
+        phase_3_results["comparison"]["strike"] == position["strike"]
+    ]
+    market_mid = float(market_row["market_mid"].iloc[0]) if not market_row.empty else None
+
+    worst_index = revaluation["scenario_pnl"].idxmin()
+    worst_pnl = revaluation.loc[worst_index, "scenario_pnl"]
+    worst_date = revaluation.loc[worst_index, "historical_date"]
+    worst_return = revaluation.loc[worst_index, "historical_return"]
+
+    # The 1st percentile of the return sample, which is roughly what the 99% VaR reads.
+    # Taken from the Phase 4 window comparison so the baseline and stress figures come
+    # from the same calculation rather than one being quoted from memory.
+    window_comparison = phase_4_results["window_comparison"]
+    our_row = window_comparison.loc[
+        window_comparison["as_of"] == pd.to_datetime(config["reference_date"])
+    ]
+    stress_row = window_comparison.loc[
+        window_comparison["as_of"] == pd.to_datetime(config["stress_window_end"])
+    ]
+
+    our_percentile = float(our_row["first_percentile"].iloc[0])
+    stress_percentile = float(stress_row["first_percentile"].iloc[0])
+
+    rows = [
+        ("POSITION", ""),
+        ("Underlying", "SPY (SPDR S&P 500 ETF Trust)"),
+        ("Contract", f"${position['strike']:.0f} {position['option_type']}, "
+                     f"expiry {config['reference_expiry']}"),
+        ("Quantity", f"{position['quantity']:+.0f} contract "
+                     f"({'long' if position['quantity'] > 0 else 'short'})"),
+        ("Exercise style", "American (BAW approximation)"),
+
+        ("MARKET STATE", ""),
+        ("Reference date", config["reference_date"]),
+        ("SPY spot", f"${phase_0_results['spot']:.2f}"),
+        ("Forward at expiry", f"${phase_0_results['forward']:.3f}  (from put-call parity)"),
+        ("Time to expiry", f"{phase_0_results['time_to_expiry_years']:.5f} years "
+                           f"({round(phase_0_results['time_to_expiry_years'] * 365)} days)"),
+        ("Risk-free rate", f"{config['risk_free_rate']:.4%}  (FRED DGS3MO)"),
+        ("Cost of carry b", f"{phase_0_results['cost_of_carry']:.4%}  (derived)"),
+
+        ("CALIBRATED SABR", ""),
+        ("alpha  (volatility level)", f"{calibration['alpha']:.6f}"),
+        ("beta   (elasticity, fixed)", f"{calibration['beta']:.4f}"),
+        ("rho    (spot/vol correlation)", f"{calibration['rho']:+.6f}"),
+        ("nu     (volatility of volatility)", f"{calibration['nu']:.6f}"),
+        ("Fit quality", f"RMSE {calibration['rmse'] * 100:.4f} vol points over "
+                        f"{calibration['n_strikes']} strikes"),
+
+        ("PRICING TODAY", ""),
+        ("SABR implied volatility", f"{revaluation.attrs['base_volatility']:.4%}"),
+        ("Theoretical price (SABR to BAW)", f"${base_price:.6f}"),
+        ("Market price (mid)",
+         f"${market_mid:.4f}" if market_mid is not None else "n/a"),
+        ("Difference",
+         f"${base_price - market_mid:+.4f}" if market_mid is not None else "n/a"),
+        ("Position value", f"${position_value:.4f}"),
+
+        ("HISTORICAL SIMULATION", ""),
+        ("Lookback window", f"{revaluation['historical_date'].iloc[0]:%Y-%m-%d} to "
+                            f"{revaluation['historical_date'].iloc[-1]:%Y-%m-%d}"),
+        ("Scenarios", f"{len(revaluation)} (unweighted, full revaluation)"),
+        ("Realised volatility in window", f"{statistics['annualised_vol']:.2%} annualised"),
+        ("Worst daily move in window", f"{statistics['min']:+.4%} on "
+                                       f"{statistics['worst_date']:%Y-%m-%d}"),
+
+        ("RESULT", ""),
+        ("99% one-day VaR", f"${var_result['var']:.4f}   "
+                            f"({var_result['var'] / abs(position_value):.2%} of position)"),
+        ("Expected shortfall", f"${var_result['expected_shortfall']:.4f}   "
+                               f"(mean of {var_result['n_breaching']} breaches)"),
+        ("Worst scenario in sample", f"${-worst_pnl:.4f} loss"),
+        ("...produced by", f"{worst_date:%Y-%m-%d}, a {worst_return:+.3%} move"),
+        (f"Stress-window VaR ({config['stress_window_end'][:4]})",
+         f"${stress_var_result['var']:.4f}   "
+         f"({stress_var_result['var'] / var_result['var']:.1f}x baseline)"),
+
+        ("HOW TO READ IT", ""),
+        ("Window contains no crisis",
+         f"1st pctile return {our_percentile:+.2%} vs {stress_percentile:+.2%} "
+         f"in a {config['stress_window_end'][:4]} window"),
+        ("BAW approximation error", "~1% of scenario P&L (measured, Phase 2)"),
+        ("Volatility surface", "frozen; spot risk only, no independent vol risk"),
+    ]
+
+    return rows
+
+
+def run_phase_8(config, phase_0_results, phase_3_results, phase_4_results,
+                phase_5_results, phase_6_results):
+    """
+    Phase 8: the remaining figures and the compiled summary.
+
+    Three figures are produced here; the other three required by the brief were produced
+    in the phases that generated their data (`spy_price_history.png` in Phase 4,
+    `sabr_fit.png` in Phases 1 and 3, `baw_vs_market_prices.png` in Phase 3).
+
+    Inputs:
+        config (dict) and the five phase result dicts.
+
+    Returns:
+        None. Writes figures and one table.
+    """
+    print_section("PHASE 8.1  RESULT FIGURES")
+
+    position = phase_5_results["position"]
+    revaluation = phase_5_results["revaluation"]
+    var_result = phase_6_results["var_result"]
+
+    plots.plot_pnl_distribution(
+        revaluation=revaluation,
+        var_result=var_result,
+        position=position,
+        base_price=phase_5_results["base_price"],
+        output_path=os.path.join(config["figures_dir"], "pnl_distribution.png"),
+    )
+
+    plots.plot_pnl_timeseries(
+        revaluation=revaluation,
+        var_result=var_result,
+        position=position,
+        output_path=os.path.join(config["figures_dir"], "pnl_timeseries.png"),
+    )
+
+    print_section("PHASE 8.2  SUMMARY TABLE")
+
+    summary_rows = build_summary_rows(config, phase_0_results, phase_3_results,
+                                      phase_4_results, phase_5_results, phase_6_results)
+
+    plots.plot_summary_table(
+        summary_rows=summary_rows,
+        output_path=os.path.join(config["figures_dir"], "summary_table.png"),
+    )
+
+    # The same content as a machine-readable table, since the image is for reading and
+    # the CSV is for anything downstream.
+    summary_path = os.path.join(config["tables_dir"], "summary.csv")
+    pd.DataFrame(
+        [row for row in summary_rows if row[1] != ""], columns=["quantity", "value"]
+    ).to_csv(summary_path, index=False)
+
+    print(f"  Saved table:  {summary_path}")
+
+    # ---- Inventory --------------------------------------------------------------------
+    print_section("PHASE 8.3  EVERYTHING THIS PIPELINE PRODUCED")
+
+    for directory, description in [(config["figures_dir"], "figures"),
+                                   (config["tables_dir"], "tables")]:
+        names = sorted(os.listdir(directory))
+        print(f"  {len(names)} {description} in {directory}/")
+        for name in names:
+            print(f"      {name}")
+        print()
+
+
 def main():
     """
     Run the full pipeline end to end.
@@ -2014,9 +2197,11 @@ def main():
     phase_4_results = run_phase_4(CONFIG, phase_0_results)
     phase_5_results = run_phase_5(CONFIG, phase_0_results, phase_3_results,
                                   phase_4_results)
-    run_phase_6(CONFIG, phase_5_results)
+    phase_6_results = run_phase_6(CONFIG, phase_5_results)
+    run_phase_8(CONFIG, phase_0_results, phase_3_results, phase_4_results,
+                phase_5_results, phase_6_results)
 
-    print_section("PHASE 6 COMPLETE")
+    print_section("PIPELINE COMPLETE")
 
 
 if __name__ == "__main__":

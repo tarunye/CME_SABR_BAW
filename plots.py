@@ -23,6 +23,25 @@ import matplotlib.pyplot as plt
 FIGURE_DPI = 150
 
 
+def escape_dollars(text):
+    """
+    Escape dollar signs so matplotlib renders them as currency rather than as maths.
+
+    Matplotlib treats text between a pair of `$` as a LaTeX maths expression. That is
+    invisible until a single string happens to contain two dollar amounts, at which point
+    everything between them silently turns italic and the dollar signs disappear -- for
+    example a title reading "1 x $475 put, position worth $6.64" loses both signs and
+    italicises the middle. Escaping each `$` as `\\$` renders it literally.
+
+    Inputs:
+        text (str): a display string that may contain currency amounts.
+
+    Returns:
+        str: the same text with every dollar sign escaped.
+    """
+    return text.replace("$", r"\$")
+
+
 def _ensure_directory(path):
     """
     Create the directory holding `path` if it does not already exist.
@@ -224,6 +243,241 @@ def plot_daily_returns_histogram(scenarios, statistics, output_path):
 
     figure.tight_layout()
     figure.savefig(output_path, dpi=FIGURE_DPI)
+    plt.close(figure)
+
+    print(f"  Saved figure: {output_path}")
+
+
+def plot_pnl_distribution(revaluation, var_result, position, base_price, output_path):
+    """
+    Plot the distribution of scenario P&Ls, with the 99% VaR threshold marked.
+
+    This is the figure the whole project exists to produce. Everything upstream — the
+    smile, the pricer, the scenarios, the revaluation — feeds into this histogram, and the
+    VaR is simply a labelled line on it.
+
+    Two things are worth looking for. The first is the **asymmetry**: for a long option the
+    distribution is skewed toward gains, because the position loses at a decelerating rate
+    as the market moves against it and gains at an accelerating rate as it moves in favour.
+    That asymmetry is gamma, and it is visible here only because every scenario was fully
+    repriced — a delta approximation would have produced a symmetric distribution and a
+    materially different tail.
+
+    The second is how **few** observations sit beyond the VaR line. At 250 scenarios and a
+    99% level there are only about two and a half, which is why the threshold has to be
+    interpolated at all and why the expected shortfall beyond it is a noisy estimate.
+
+    Inputs:
+        revaluation (DataFrame): output of `main.revalue_across_scenarios`, with
+            'scenario_pnl' and 'historical_date'.
+        var_result (dict):       output of `var.compute_var`.
+        position (dict):         the position, for the title.
+        base_price (float):      today's theoretical price of one option, in dollars.
+        output_path (str):       where to write the .png.
+
+    Returns:
+        None. Writes a file to `output_path`.
+    """
+    _ensure_directory(output_path)
+
+    figure, axes = plt.subplots(figsize=(11, 6.5))
+
+    pnls = revaluation["scenario_pnl"]
+
+    # The VaR is reported as a positive loss magnitude, so the line belongs at its
+    # negative on a P&L axis. Same for expected shortfall.
+    var_threshold = -var_result["var"]
+    shortfall_threshold = -var_result["expected_shortfall"]
+
+    counts, bin_edges, patches = axes.hist(
+        pnls, bins=45, color="#1f77b4", alpha=0.75, edgecolor="white", linewidth=0.5,
+        zorder=3,
+    )
+
+    # Shade the breaching scenarios in a different colour so the tail is unmistakable.
+    for patch, left_edge in zip(patches, bin_edges[:-1]):
+        if left_edge < var_threshold:
+            patch.set_facecolor("#d62728")
+
+    axes.axvline(var_threshold, color="black", linestyle="--", linewidth=1.8,
+                 label=escape_dollars(f"99% VaR = ${var_result['var']:.4f} loss"),
+                 zorder=5)
+    axes.axvline(shortfall_threshold, color="#7f7f7f", linestyle=":", linewidth=1.8,
+                 label=escape_dollars(
+                     f"Expected shortfall = ${var_result['expected_shortfall']:.4f}"),
+                 zorder=5)
+    axes.axvline(0.0, color="black", linewidth=0.8, zorder=4)
+
+    # Annotate the single worst scenario, which is the deepest observation in the tail.
+    worst_index = pnls.idxmin()
+    worst_pnl = pnls.loc[worst_index]
+    worst_date = revaluation.loc[worst_index, "historical_date"]
+    worst_return = revaluation.loc[worst_index, "historical_return"]
+
+    axes.annotate(
+        escape_dollars(
+            f"Worst scenario\n{worst_date:%Y-%m-%d} ({worst_return:+.2%})\n"
+            f"${-worst_pnl:.4f} loss"
+        ),
+        xy=(worst_pnl, 1.0),
+        xytext=(0.06, 0.62), textcoords="axes fraction",
+        fontsize=9, ha="left",
+        arrowprops={"arrowstyle": "->", "color": "#d62728", "linewidth": 1.3,
+                    "connectionstyle": "arc3,rad=-0.2"},
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.95,
+              "edgecolor": "#d62728"},
+        zorder=6,
+    )
+
+    axes.set_xlabel("Scenario profit and loss ($ per contract)")
+    axes.set_ylabel("Number of scenarios")
+    axes.set_title(escape_dollars(
+        f"Distribution of scenario P&L under full revaluation\n"
+        f"{position['quantity']:+.0f} x ${position['strike']:.0f} "
+        f"{position['option_type']}, {len(pnls)} scenarios, position worth "
+        f"${position['quantity'] * base_price:.4f} today"
+    ))
+    axes.legend(loc="upper left", frameon=True, fontsize=9)
+    axes.grid(alpha=0.3, axis="y", zorder=1)
+
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=FIGURE_DPI)
+    plt.close(figure)
+
+    print(f"  Saved figure: {output_path}")
+
+
+def plot_pnl_timeseries(revaluation, var_result, position, output_path):
+    """
+    Plot each scenario's P&L against the historical date whose move produced it.
+
+    The histogram says how the losses are distributed; this says WHEN they came from. It
+    is the figure that connects an abstract risk number back to identifiable market
+    episodes, and the one that makes the central weakness of historical simulation
+    visible: the tail is a handful of specific days, and when those days roll out of the
+    lookback window the risk estimate will drop for no reason connected to the market.
+
+    Scenarios that breach the VaR are drawn in red and dated, so the episodes driving the
+    number can be read off directly.
+
+    Inputs:
+        revaluation (DataFrame): output of `main.revalue_across_scenarios`.
+        var_result (dict):       output of `var.compute_var`.
+        position (dict):         the position, for the title.
+        output_path (str):       where to write the .png.
+
+    Returns:
+        None. Writes a file to `output_path`.
+    """
+    _ensure_directory(output_path)
+
+    figure, axes = plt.subplots(figsize=(12, 6.5))
+
+    var_threshold = -var_result["var"]
+    breaches = revaluation["scenario_pnl"] <= var_threshold
+
+    axes.vlines(revaluation.loc[~breaches, "historical_date"], 0,
+                revaluation.loc[~breaches, "scenario_pnl"],
+                color="#1f77b4", alpha=0.55, linewidth=1.4, zorder=3)
+    axes.scatter(revaluation.loc[~breaches, "historical_date"],
+                 revaluation.loc[~breaches, "scenario_pnl"],
+                 s=14, color="#1f77b4", label="Scenario P&L", zorder=4)
+
+    axes.vlines(revaluation.loc[breaches, "historical_date"], 0,
+                revaluation.loc[breaches, "scenario_pnl"],
+                color="#d62728", linewidth=1.8, zorder=5)
+    axes.scatter(revaluation.loc[breaches, "historical_date"],
+                 revaluation.loc[breaches, "scenario_pnl"],
+                 s=42, color="#d62728",
+                 label=f"Breaches the 99% VaR ({int(breaches.sum())} scenarios)", zorder=6)
+
+    axes.axhline(0.0, color="black", linewidth=0.8, zorder=2)
+    axes.axhline(var_threshold, color="black", linestyle="--", linewidth=1.6,
+                 label=escape_dollars(f"99% VaR = ${var_result['var']:.4f} loss"),
+                 zorder=5)
+
+    # Label each breaching date, since naming the episodes is the point of the figure.
+    for _, row in revaluation.loc[breaches].iterrows():
+        axes.annotate(f"{row['historical_date']:%b %d}",
+                      xy=(row["historical_date"], row["scenario_pnl"]),
+                      xytext=(0, -14), textcoords="offset points",
+                      fontsize=8, ha="center", color="#d62728", zorder=7)
+
+    axes.set_xlabel("Historical date the daily move was taken from")
+    axes.set_ylabel("Scenario profit and loss ($ per contract)")
+    axes.set_title(escape_dollars(
+        f"Scenario P&L by the market episode that produced it\n"
+        f"{position['quantity']:+.0f} x ${position['strike']:.0f} "
+        f"{position['option_type']} — a long put loses when the market RALLIES, so the "
+        f"tail is the best days of the year"
+    ))
+    axes.legend(loc="upper left", frameon=True, fontsize=9)
+    axes.grid(alpha=0.3, zorder=1)
+
+    figure.autofmt_xdate()
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=FIGURE_DPI)
+    plt.close(figure)
+
+    print(f"  Saved figure: {output_path}")
+
+
+def plot_summary_table(summary_rows, output_path):
+    """
+    Render the headline results as a table image.
+
+    A CSV is the right format for a machine and the wrong one for a reader glancing at a
+    directory of figures. This renders the same numbers as a picture so the whole result
+    can be taken in at once, and so it can be dropped into a document alongside the charts.
+
+    Inputs:
+        summary_rows (list): rows as (label, value) string pairs. A row whose value is the
+            empty string is rendered as a section heading.
+        output_path (str):   where to write the .png.
+
+    Returns:
+        None. Writes a file to `output_path`.
+    """
+    _ensure_directory(output_path)
+
+    # Height scales with the row count so the text keeps a constant size whatever the
+    # table length, rather than being squeezed into a fixed canvas.
+    figure, axes = plt.subplots(figsize=(10.5, 0.30 * len(summary_rows) + 0.9))
+    axes.axis("off")
+
+    table = axes.table(
+        cellText=[[escape_dollars(label), escape_dollars(value)]
+                  for label, value in summary_rows],
+        colWidths=[0.52, 0.48],
+        cellLoc="left",
+        loc="upper center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9.5)
+    table.scale(1, 1.45)
+
+    for (row_index, column_index), cell in table.get_celld().items():
+        label, value = summary_rows[row_index]
+        cell.set_edgecolor("#d8d8d8")
+
+        if value == "":
+            # A section heading: bold, shaded, spanning visually across both columns.
+            cell.set_facecolor("#e8eef5")
+            cell.set_text_props(weight="bold", color="#1a3a5a")
+        else:
+            cell.set_facecolor("#ffffff" if row_index % 2 == 0 else "#f7f7f7")
+            if column_index == 0:
+                cell.set_text_props(color="#333333")
+            else:
+                cell.set_text_props(family="monospace", weight="bold")
+
+    axes.set_title("SPY options VaR — summary of results\n"
+                   "SR-FICC-2013-02 methodology: SABR + Barone-Adesi & Whaley + "
+                   "historical simulation",
+                   fontsize=12, pad=18)
+
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight")
     plt.close(figure)
 
     print(f"  Saved figure: {output_path}")

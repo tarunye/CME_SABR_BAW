@@ -4,7 +4,7 @@ Running record of what has been built, decided, and deferred. Append-only: each 
 a section, nothing earlier gets rewritten. If you are picking this project up cold, read
 this file top to bottom and you will know exactly where things stand.
 
-**Current status: Phase 6 complete. Awaiting approval for Phase 7.**
+**Current status: COMPLETE. Phases 0-6 and 8 built; Phase 7 skipped by choice.**
 
 ---
 
@@ -32,6 +32,8 @@ Built in nine phases (0-8), one at a time, stopping for written approval after e
 | `historical_sim.py` | Daily returns, scenario generation, return-sample statistics, tail and lookback-window diagnostics | Phase 4 |
 | `var.py` | 99% VaR by explicit interpolation between order statistics, expected shortfall, and the rank-convention comparison | Phase 6 |
 | `plots.py` | One function per figure, all saving to `outputs/figures/` | Phase 0 |
+| `requirements.txt` | Pinned dependency versions | Phase 8 |
+| `README.md` | Project overview, data sourcing, figure guide, consolidated assumptions, limitations | Phase 8 |
 | `main.py` | `CONFIG` block (every assumption, with sources) and the phase runners | Phase 0 |
 | `data/spy_eod_YYYY.parquet` | Raw vendor data, 2010-2023 (supplied, not generated) | — |
 | `data/*.csv` | Cached derived pulls, regenerated if deleted | Phase 0 |
@@ -845,6 +847,69 @@ Two caveats carry forward, both quantified earlier rather than asserted here:
   of the position.
 - **BAW's approximation error contributes roughly 1%** to the scenario P&Ls (Phase 2), and
   therefore to this number.
+
+---
+
+## PHASE 7 — Portfolio VaR ⏭️ skipped by choice
+
+The brief made this phase conditional and required asking first. Offered at the end of
+Phase 6 and declined: the single-option result was sufficient. Had it been built it would
+have extended to several strikes across at least two expiries with signed positions, given
+**each expiry its own SABR calibration** (reusing one calibration across tenors is a common
+and expensive mistake, since smile shape differs by tenor), aggregated P&L per scenario
+before computing VaR, and reported the diversification benefit against the sum of the
+standalone VaRs.
+
+---
+
+## PHASE 8 — Visualisation suite and results compilation ✅ complete
+
+### What was built
+
+Three new figures in `plots.py` — `plot_pnl_distribution`, `plot_pnl_timeseries`,
+`plot_summary_table` — plus `build_summary_rows` and `run_phase_8` in `main.py`,
+`requirements.txt` with pinned versions, and a fully expanded `README.md`.
+
+The other three figures the brief requires were already produced by the phases that
+generated their data: `spy_price_history.png` (Phase 4), `sabr_fit.png` (Phases 1 and 3),
+`baw_vs_market_prices.png` (Phase 3).
+
+### Final output inventory
+
+**9 figures**, all at 150 DPI with titles, axis labels carrying units, and legends:
+
+| Figure | Phase |
+|---|---|
+| `vol_smile_raw.png` | 0 |
+| `sabr_fit.png` | 1, regenerated in 3 |
+| `reimplied_vs_vendor_vols.png` | 3 |
+| `baw_vs_market_prices.png` | 3 |
+| `spy_price_history.png` | 4 |
+| `daily_returns_histogram.png` | 4 |
+| `pnl_distribution.png` | **8** |
+| `pnl_timeseries.png` | **8** |
+| `summary_table.png` | **8** |
+
+**16 tables** in `outputs/tables/`, including `summary.csv` as the machine-readable twin
+of the summary image.
+
+### Two rendering bugs found and fixed
+
+1. **Matplotlib was parsing currency as LaTeX maths.** Text between a pair of `$` is
+   treated as a maths expression, so a title reading `+1 x $475 put, 250 scenarios,
+   position worth $6.6391 today` silently lost both dollar signs and italicised everything
+   between them. Invisible until a single string happens to carry two dollar amounts.
+   Fixed with a `plots.escape_dollars` helper, applied to composed money strings.
+2. **A mislabelled row in the summary table.** "Window contains no crisis" was quoting
+   `statistics["min"]` — the *worst daily move*, −2.00% — under the label "1st pctile
+   return", which is −1.64%. Now pulled from the Phase 4 window comparison so the baseline
+   and stress figures come from the same calculation.
+
+### Verification
+
+Cold run from deleted caches completes in ~9 seconds; all five entry points exit 0
+(`main.py`, `sabr.py`, `baw.py`, `historical_sim.py`, `var.py`), and `baw.py`'s ten-check
+suite passes.
 
 ---
 
