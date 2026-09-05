@@ -11,10 +11,12 @@ scattered through the other modules -- anything you might want to change is here
 
 import os
 
+import numpy as np
 import pandas as pd
 
 import baw
 import data_loader
+import historical_sim
 import plots
 import sabr
 
@@ -49,6 +51,18 @@ CONFIG = {
     # return series has a full lookback available with room to spare.
     "lookback_days": 250,
     "price_history_start": "2022-01-03",
+
+    # Used only for the Phase 4 diagnostic showing how much the risk estimate depends on
+    # which twelve months happen to precede the reference date. Not part of the VaR.
+    "window_comparison_start": "2010-01-04",
+    "window_comparison_dates": [
+        "2011-12-30",  # post-crisis, European sovereign debt stress
+        "2015-12-31",  # calm, before the August 2015 flash crash aged out
+        "2018-12-31",  # the February volatility spike and the Q4 selloff
+        "2020-12-31",  # the COVID crash sits squarely inside this window
+        "2022-12-30",  # the 2022 bear market
+        "2023-12-29",  # ours
+    ],
 
     # ---- Rates and carry -------------------------------------------------------------
     # 3-month Treasury constant maturity yield on 2023-12-29 (FRED series DGS3MO).
@@ -971,6 +985,206 @@ def run_phase_3(config, phase_0_results, phase_1_results):
     }
 
 
+def run_phase_4(config, phase_0_results):
+    """
+    Phase 4: build the historical simulation scenarios. No option pricing happens here.
+
+    This phase is purely about the underlying: it converts the SPY price history into a set
+    of alternative prices for tomorrow. Phase 5 is what reprices the option under each one.
+
+    Inputs:
+        config (dict):          the CONFIG block above.
+        phase_0_results (dict): output of `run_phase_0`, for the price history and spot.
+
+    Returns:
+        dict carrying:
+            'returns'    (DataFrame) all daily returns available
+            'scenarios'  (DataFrame) the lookback-window scenarios, one row each
+            'statistics' (dict)      summary statistics of the return sample
+    """
+    prices = phase_0_results["prices"]
+    spot = phase_0_results["spot"]
+    lookback_days = config["lookback_days"]
+
+    # ---- Returns and scenarios --------------------------------------------------------
+    print_section("PHASE 4.1  SCENARIO GENERATION")
+
+    returns = historical_sim.compute_daily_returns(prices)
+    scenarios = historical_sim.generate_scenarios(
+        current_price=spot,
+        historical_returns=returns,
+        lookback_days=lookback_days,
+    )
+
+    print(f"  Price history available   : {len(prices)} days "
+          f"({prices['date'].iloc[0]:%Y-%m-%d} to {prices['date'].iloc[-1]:%Y-%m-%d})")
+    print(f"  Daily returns computed    : {len(returns)}")
+    print(f"  Lookback window used      : {lookback_days} days "
+          f"({scenarios['historical_date'].iloc[0]:%Y-%m-%d} to "
+          f"{scenarios['historical_date'].iloc[-1]:%Y-%m-%d})")
+    print(f"  Today's SPY price         : ${spot:.2f}")
+    print(f"  Scenario price range      : "
+          f"${scenarios['scenario_price'].min():.2f} to "
+          f"${scenarios['scenario_price'].max():.2f}")
+
+    # Confirm the window is free of the vendor date-stamping defects that Phase 0 found in
+    # the 2022 file. This matters more here than anywhere else: a missing trading day would
+    # compress two sessions into one return and manufacture a tail event that never
+    # happened, and the tail is precisely what the VaR reads.
+    window_days = data_loader.nyse_trading_days(
+        scenarios["historical_date"].iloc[0], scenarios["historical_date"].iloc[-1]
+    )
+    dates_in_window = pd.DatetimeIndex(scenarios["historical_date"])
+    missing_in_window = window_days.difference(dates_in_window)
+    phantom_in_window = dates_in_window.difference(window_days)
+
+    print(f"  Calendar defects in window: {len(missing_in_window)} missing, "
+          f"{len(phantom_in_window)} phantom  <- must both be 0")
+
+    # ---- Summary statistics -----------------------------------------------------------
+    print_section("PHASE 4.2  RETURN SAMPLE STATISTICS")
+
+    statistics = historical_sim.summarise_returns(scenarios)
+
+    # ---- Extremes ---------------------------------------------------------------------
+    print_section("PHASE 4.3  LARGEST MOVES IN THE SAMPLE")
+
+    largest_down, largest_up = historical_sim.largest_moves(scenarios, n=5)
+
+    def format_moves(moves):
+        """Render a small table of extreme moves."""
+        lines = []
+        for _, row in moves.iterrows():
+            lines.append(
+                f"    {row['historical_date']:%Y-%m-%d}  "
+                f"{row['historical_return']:+8.4%}  ->  "
+                f"scenario price ${row['scenario_price']:.2f}"
+            )
+        return "\n".join(lines)
+
+    print("  Five largest DOWN moves (these drive the VaR for a long position):")
+    print(format_moves(largest_down))
+    print()
+    print("  Five largest UP moves:")
+    print(format_moves(largest_up))
+    print()
+    print("  Sanity check: these should be recognisable market dates, not quiet Tuesdays.")
+    print("  A big move on a day nothing happened would point to a missing trading day")
+    print("  compressing two sessions into one return.")
+
+    # ---- Fat tails --------------------------------------------------------------------
+    print_section("PHASE 4.4  ARE THE TAILS FATTER THAN A NORMAL?")
+
+    tail_comparison = historical_sim.compare_tails_against_normal(scenarios)
+
+    print("  Days exceeding each threshold, observed against what a fitted normal predicts:")
+    print(f"    {'threshold':>10} {'observed':>9} {'normal says':>12} {'ratio':>8}")
+
+    for _, row in tail_comparison.iterrows():
+        ratio_text = f"{row['ratio']:.2f}x" if np.isfinite(row["ratio"]) else "  --"
+        print(f"    {row['threshold_sigma']:>9.0f}s {int(row['observed']):>9d} "
+              f"{row['normal_expected']:>12.2f} {ratio_text:>8}")
+
+    print()
+    print("  Read this carefully rather than assuming the textbook answer. Long samples of")
+    print("  equity returns are reliably fat-tailed, but a single 250-day window need not")
+    print("  be -- and this one is not. See the window comparison below.")
+
+    # ---- How much does the answer depend on WHICH year we happen to be standing in? ----
+    print_section("PHASE 4.5  HOW MUCH DOES THE LOOKBACK WINDOW MATTER?")
+
+    long_history_path = os.path.join(config["data_dir"], "spy_price_history_full.csv")
+    long_prices = data_loader.load_spy_price_history(
+        data_dir=config["data_dir"],
+        start_date=config["window_comparison_start"],
+        end_date=config["reference_date"],
+        cache_path=long_history_path,
+    )
+    long_returns = historical_sim.compute_daily_returns(long_prices)
+
+    window_comparison = historical_sim.rolling_window_statistics(
+        returns=long_returns,
+        reference_dates=config["window_comparison_dates"],
+        lookback_days=lookback_days,
+    )
+
+    print(f"  The SAME position, the SAME model, the SAME {lookback_days}-day method --")
+    print(f"  evaluated as if we were standing at the end of each of these years instead:")
+    print()
+    print(f"    {'as of':>12} {'ann. vol':>9} {'skew':>8} {'exc.kurt':>9} "
+          f"{'worst day':>10} {'1st pctile':>11}")
+
+    for _, row in window_comparison.iterrows():
+        marker = "  <- ours" if row["as_of"] == pd.to_datetime(
+            config["reference_date"]) else ""
+        print(f"    {row['as_of']:%Y-%m-%d} {row['annualised_vol']:>8.2%} "
+              f"{row['skewness']:>+8.3f} {row['excess_kurtosis']:>+9.3f} "
+              f"{row['worst_day']:>+10.2%} {row['first_percentile']:>+11.2%}{marker}")
+
+    ours = window_comparison.loc[
+        window_comparison["as_of"] == pd.to_datetime(config["reference_date"])
+    ]
+
+    if not ours.empty:
+        worst_window = window_comparison.loc[window_comparison["first_percentile"].idxmin()]
+        our_percentile = float(ours["first_percentile"].iloc[0])
+        ratio = worst_window["first_percentile"] / our_percentile
+
+        print()
+        print(f"  Our window's 1st percentile is {our_percentile:+.2%}. The harshest window")
+        print(f"  in this comparison ({worst_window['as_of']:%Y-%m-%d}) has "
+              f"{worst_window['first_percentile']:+.2%} -- {ratio:.1f}x larger.")
+        print(f"  That factor is not a modelling choice or a market view. It is entirely a")
+        print(f"  consequence of WHICH twelve months happen to sit behind the reference")
+        print(f"  date, and it is the central weakness of unweighted historical simulation:")
+        print(f"  a crisis counts fully until the day it ages out of the window, then not")
+        print(f"  at all. Our 2023 window contains no crisis, so the Phase 6 VaR will be")
+        print(f"  correspondingly benign. That is the method working as specified, not a")
+        print(f"  bug -- but it is the number's biggest caveat.")
+
+    # NOTE (approximation): the comparison years are shown for context only and are not
+    # subjected to the Phase 0 calendar validation. Data quality varies across the vendor's
+    # history -- 2022 alone carries 4 missing trading days and 9 phantom rows stamped on
+    # market holidays. Our own 2023 window is clean, which is what matters for the result.
+
+    # ---- Tables and figures ------------------------------------------------------------
+    print_section("PHASE 4.6  TABLES AND FIGURES")
+
+    scenario_path = os.path.join(config["tables_dir"], "scenarios.csv")
+    scenarios.to_csv(scenario_path, index=False)
+
+    statistics_path = os.path.join(config["tables_dir"], "return_statistics.csv")
+    pd.DataFrame([statistics]).to_csv(statistics_path, index=False)
+
+    window_path = os.path.join(config["tables_dir"], "lookback_window_comparison.csv")
+    window_comparison.to_csv(window_path, index=False)
+
+    plots.plot_spy_price_history(
+        prices=prices,
+        scenarios=scenarios,
+        reference_date=config["reference_date"],
+        output_path=os.path.join(config["figures_dir"], "spy_price_history.png"),
+    )
+
+    plots.plot_daily_returns_histogram(
+        scenarios=scenarios,
+        statistics=statistics,
+        output_path=os.path.join(config["figures_dir"],
+                                 "daily_returns_histogram.png"),
+    )
+
+    print(f"  Saved table:  {scenario_path}")
+    print(f"  Saved table:  {statistics_path}")
+    print(f"  Saved table:  {window_path}")
+
+    return {
+        "returns": returns,
+        "scenarios": scenarios,
+        "statistics": statistics,
+        "window_comparison": window_comparison,
+    }
+
+
 def main():
     """
     Run the full pipeline end to end.
@@ -985,8 +1199,9 @@ def main():
     phase_0_results = run_phase_0(CONFIG)
     phase_1_results = run_phase_1(CONFIG, phase_0_results)
     run_phase_3(CONFIG, phase_0_results, phase_1_results)
+    run_phase_4(CONFIG, phase_0_results)
 
-    print_section("PHASE 3 COMPLETE")
+    print_section("PHASE 4 COMPLETE")
 
 
 if __name__ == "__main__":

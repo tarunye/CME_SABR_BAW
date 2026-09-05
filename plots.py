@@ -103,6 +103,132 @@ def plot_raw_vol_smile(smile, spot, forward, reference_date, expiry_date, output
     print(f"  Saved figure: {output_path}")
 
 
+def plot_spy_price_history(prices, scenarios, reference_date, output_path):
+    """
+    Plot the SPY price path, with the historical simulation lookback window marked.
+
+    The shaded region is the only part of this history the VaR calculation can see. Days
+    outside it -- including the whole 2022 drawdown, which took SPY from $477 down to $357
+    -- contribute nothing at all to the risk estimate. Drawing the boundary explicitly
+    makes that limitation visible rather than buried in a parameter: the model's entire
+    view of "what could happen tomorrow" is the shaded strip.
+
+    Inputs:
+        prices (DataFrame):    the full loaded price series, columns 'date', 'spy_close'.
+        scenarios (DataFrame): output of `historical_sim.generate_scenarios`, used to mark
+            the window boundaries.
+        reference_date (str):  the quote date, "YYYY-MM-DD".
+        output_path (str):     where to write the .png.
+
+    Returns:
+        None. Writes a file to `output_path`.
+    """
+    _ensure_directory(output_path)
+
+    figure, axes = plt.subplots(figsize=(11, 6))
+
+    window_start = scenarios["historical_date"].iloc[0]
+    window_end = scenarios["historical_date"].iloc[-1]
+
+    axes.plot(prices["date"], prices["spy_close"], color="#333333", linewidth=1.2,
+              label="SPY close", zorder=3)
+
+    axes.axvspan(window_start, window_end, color="#1f77b4", alpha=0.15,
+                 label=f"{len(scenarios)}-day lookback window used for VaR", zorder=2)
+
+    # Mark today's price, since every scenario is built by applying a historical move to
+    # exactly this level.
+    final_price = prices["spy_close"].iloc[-1]
+    axes.axhline(final_price, color="#d62728", linestyle="--", linewidth=1.0,
+                 label=f"Price on {reference_date} = ${final_price:.2f}", zorder=4)
+
+    axes.set_xlabel("Date")
+    axes.set_ylabel("SPY closing price ($)")
+    axes.set_title(
+        f"SPY price history and the historical simulation window\n"
+        f"Only moves inside the shaded region enter the VaR calculation"
+    )
+    axes.legend(loc="lower right", frameon=True)
+    axes.grid(alpha=0.3, zorder=1)
+
+    figure.autofmt_xdate()
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=FIGURE_DPI)
+    plt.close(figure)
+
+    print(f"  Saved figure: {output_path}")
+
+
+def plot_daily_returns_histogram(scenarios, statistics, output_path):
+    """
+    Plot the distribution of the sampled daily returns, against a fitted normal.
+
+    The normal curve is drawn NOT because we use it -- historical simulation deliberately
+    assumes no distribution -- but as a foil, so the shape of the real sample can be read
+    against a familiar reference. The title carries the skewness and excess kurtosis, both
+    of which a normal scores zero on.
+
+    Which way the divergence runs is an empirical question, not a given. A window
+    containing a crisis will show the textbook fat tails sitting above the curve. A calm
+    window can show the opposite, because a normal fitted to a calm year is stretched wide
+    by a handful of moderately large days and ends up with more tail weight than the data
+    itself. Read the numbers in the title.
+
+    The 1st percentile is marked because that is the neighbourhood the 99% VaR will be read
+    from in Phase 6.
+
+    Inputs:
+        scenarios (DataFrame):  output of `historical_sim.generate_scenarios`.
+        statistics (dict):      output of `historical_sim.summarise_returns`.
+        output_path (str):      where to write the .png.
+
+    Returns:
+        None. Writes a file to `output_path`.
+    """
+    from scipy.stats import norm
+
+    _ensure_directory(output_path)
+
+    figure, axes = plt.subplots(figsize=(11, 6))
+
+    returns_in_percent = scenarios["historical_return"] * 100
+
+    axes.hist(returns_in_percent, bins=40, color="#1f77b4", alpha=0.75,
+              edgecolor="white", linewidth=0.5, density=True,
+              label=f"Observed daily returns ({len(scenarios)} days)", zorder=3)
+
+    # The fitted normal uses the sample's own mean and standard deviation, so any
+    # divergence is purely about SHAPE rather than about level or scale.
+    grid = np.linspace(returns_in_percent.min() * 1.15, returns_in_percent.max() * 1.15,
+                       400)
+    fitted = norm.pdf(grid, loc=statistics["mean"] * 100, scale=statistics["std"] * 100)
+
+    axes.plot(grid, fitted, color="#d62728", linewidth=1.8,
+              label="Normal with the same mean and standard deviation", zorder=4)
+
+    # The 1st percentile of the return sample -- roughly where the 99% VaR will be read.
+    first_percentile = np.percentile(returns_in_percent, 1.0)
+    axes.axvline(first_percentile, color="black", linestyle="--", linewidth=1.4,
+                 label=f"1st percentile = {first_percentile:.2f}%", zorder=5)
+
+    axes.set_xlabel("Daily return (%)")
+    axes.set_ylabel("Probability density")
+    axes.set_title(
+        f"Distribution of SPY daily returns in the lookback window\n"
+        f"Skewness {statistics['skewness']:+.3f}, excess kurtosis "
+        f"{statistics['excess_kurtosis']:+.3f} "
+        f"(a normal distribution scores 0 on both)"
+    )
+    axes.legend(loc="upper left", frameon=True, fontsize=9)
+    axes.grid(alpha=0.3, zorder=1)
+
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=FIGURE_DPI)
+    plt.close(figure)
+
+    print(f"  Saved figure: {output_path}")
+
+
 def plot_reimplied_vs_vendor_vols(comparison, forward, spot, reference_date, expiry_date,
                                   output_path):
     """

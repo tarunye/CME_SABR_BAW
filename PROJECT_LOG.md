@@ -4,7 +4,7 @@ Running record of what has been built, decided, and deferred. Append-only: each 
 a section, nothing earlier gets rewritten. If you are picking this project up cold, read
 this file top to bottom and you will know exactly where things stand.
 
-**Current status: Phase 3 complete. Awaiting approval for Phase 4.**
+**Current status: Phase 4 complete. Awaiting approval for Phase 5.**
 
 ---
 
@@ -520,6 +520,116 @@ out-of-the-money strike ever hits either:
 `sabr.py` standalone now prefers `reimplied_smile.csv` when it exists, so `python3 sabr.py`
 reports the same parameters as `python3 main.py` rather than the superseded vendor-IV ones.
 Phase 1's tables were renamed to `*_vendor_iv.csv` so they cannot be confused with Phase 3's.
+
+---
+
+## PHASE 4 — Historical simulation scenario generation ✅ complete, awaiting approval
+
+### What was built
+
+`historical_sim.py` — `compute_daily_returns`, `generate_scenarios`, `summarise_returns`,
+`largest_moves`, `compare_tails_against_normal`, `rolling_window_statistics`. Plus
+`plot_spy_price_history` and `plot_daily_returns_histogram`, and `run_phase_4` in `main.py`.
+
+Runnable standalone: `python3 historical_sim.py`. No option pricing anywhere in this phase.
+
+### The scenarios
+
+250 scenarios from the window **2023-01-03 to 2023-12-29** — exactly calendar 2023, since
+250 trading days back from the reference date lands on the first trading day of the year.
+Scenario prices run **$465.80 to $486.16** around today's $475.31. Zero calendar defects in
+the window (checked explicitly against the derived NYSE calendar, since a missing trading
+day would compress two sessions into one return and manufacture a tail event).
+
+| Statistic | Value |
+|---|---|
+| Mean daily return | +0.0904% |
+| Daily volatility | 0.8277% |
+| **Annualised volatility** | **13.14%** |
+| Skewness | −0.0278 |
+| **Excess kurtosis** | **−0.1784** |
+| Worst day | **−2.0012%** on 2023-02-21 |
+| Best day | +2.2827% on 2023-01-06 |
+
+Five largest down moves: 2023-02-21 (−2.00%), 2023-03-09 (−1.81%), 2023-03-22 (−1.66%),
+2023-09-21 (−1.62%), 2023-04-25 (−1.58%). These are recognisable 2023 episodes — the
+February inflation repricing, the March regional-banking stress, and the September FOMC —
+rather than quiet days, which is the sanity check that no missing session has fabricated a
+move.
+
+### The headline finding: this window has THIN tails, and I had assumed otherwise
+
+I wrote comments asserting that daily equity returns "essentially always" show positive
+excess kurtosis, which is the standard argument against parametric normal VaR. **The data
+contradicted that for this window and I corrected the comments.**
+
+| Threshold | Observed | Normal predicts | Ratio |
+|---|---|---|---|
+| 2σ | 13 | 11.38 | 1.14× |
+| 3σ | **0** | 0.67 | 0.00× |
+| 4σ | **0** | 0.02 | 0.00× |
+
+Excess kurtosis of **−0.18** means the tails are *thinner* than a normal, not fatter. Not
+a single day in 2023 moved more than 3 standard deviations. The mechanism is
+straightforward once seen: a normal fitted to a calm year is stretched wide by the handful
+of moderately large days, ending up with more tail weight than the data itself.
+
+The long-run textbook result is real; it just does not hold over this particular
+250 trading days. The code now says so and points at the evidence rather than asserting the
+generality.
+
+### How much does the window matter? A lot.
+
+The same position, same model, same method, evaluated as if standing at the end of each
+year instead:
+
+| As of | Ann. vol | Skew | Excess kurt | Worst day | 1st percentile |
+|---|---|---|---|---|---|
+| 2011-12-30 | 23.08% | −0.433 | +2.581 | −6.51% | −4.34% |
+| 2015-12-31 | 15.65% | −0.231 | +2.117 | −4.13% | −2.78% |
+| 2018-12-31 | 17.18% | −0.409 | +3.148 | −4.21% | −3.21% |
+| 2020-12-31 | 34.14% | −0.598 | +7.631 | −11.51% | −6.76% |
+| 2022-12-30 | 24.09% | +0.026 | +0.362 | −4.34% | −3.74% |
+| **2023-12-29 (ours)** | **13.14%** | **−0.028** | **−0.178** | **−2.00%** | **−1.64%** |
+
+Ours is the calmest of the six by a wide margin, and the **only one with negative excess
+kurtosis** — every other window shows the textbook fat tails. The 1st percentile, which is
+essentially what the 99% VaR reads, is **−1.64% for us against −6.76% for a 2020 window:
+4.1× larger**.
+
+That factor is not a modelling choice or a market view. It is entirely a consequence of
+which twelve months precede the reference date. This is the central weakness of unweighted
+historical simulation: a crisis counts fully until the day it ages out of the window, then
+not at all. **The Phase 6 VaR will be correspondingly benign, and that is the number's
+biggest single caveat.** The method is working exactly as the filing specifies.
+
+`spy_price_history.png` shows this directly: the entire 2022 bear market, which took SPY
+from $477 to $357, sits outside the shaded window and contributes nothing.
+
+### A latent bug fixed
+
+`load_spy_price_history` returned a cached CSV **without checking it covered the requested
+date range**. Harmless while there was one cache; Phase 4 introduced a second with a
+different range, at which point changing a date in CONFIG would silently return the
+previous range and every downstream number would be computed from data the config no
+longer describes — the worst kind of bug, since nothing fails and the output looks
+reasonable. The cache is now validated against the requested range and rebuilt if it falls
+short, with a printed notice.
+
+### Decisions taken
+
+1. **Simple returns, not log returns.** They are exactly what `S * (1 + r)` needs. The two
+   differ by second order; at this sample's worst day (−2.00%) the log return is −2.02%, a
+   2bp difference on the scenario price. Log returns' advantage is additive aggregation
+   across time, which matters for multi-day horizons and ours is one day.
+2. **Unweighted window**, matching the filing. No exponential weighting, no filtered
+   historical simulation rescaling by current-to-historical volatility. Noted in the module
+   docstring as a deliberate deviation from common practice, made in order to match the
+   filing rather than to improve the estimate.
+3. **The window comparison years are shown for context only** and are not put through the
+   Phase 0 calendar validation. Data quality varies across the vendor's history — 2022
+   alone carries 4 missing trading days and 9 phantom rows. Our own 2023 window is clean,
+   which is what matters for the result.
 
 ---
 
