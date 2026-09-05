@@ -4,7 +4,7 @@ Running record of what has been built, decided, and deferred. Append-only: each 
 a section, nothing earlier gets rewritten. If you are picking this project up cold, read
 this file top to bottom and you will know exactly where things stand.
 
-**Current status: Phase 4 complete. Awaiting approval for Phase 5.**
+**Current status: Phase 5 complete. Awaiting approval for Phase 6.**
 
 ---
 
@@ -630,6 +630,124 @@ short, with a printed notice.
    Phase 0 calendar validation. Data quality varies across the vendor's history — 2022
    alone carries 4 missing trading days and 9 phantom rows. Our own 2023 window is clean,
    which is what matters for the result.
+
+---
+
+## PHASE 5 — Full revaluation loop ✅ complete, awaiting approval
+
+### The position
+
+**Long 1 × SPY 2024-02-16 $475 put.** Spot $475.31, forward $478.892, T = 49 days held
+fixed. SABR vol today 11.7554%, theoretical price **$6.639087** against a market mid of
+$6.5250 (+$0.1141).
+
+### What was built
+
+Two functions in `main.py`, next to `price_option_with_sabr`:
+
+- `revalue_across_scenarios` — the loop. For each scenario: move spot, recompute the
+  forward, get a **fresh SABR vol**, run a **fresh BAW reprice**. A plain loop, one
+  scenario per iteration, no vectorisation.
+- `taylor_approximation_counterfactual` — deliberately computes the shortcut the filing
+  **forbids**, purely to show in dollars what the prohibition buys. Never used for a risk
+  number.
+
+Placed in `main.py` rather than a new module because they are the orchestration that joins
+SABR, BAW and the scenarios — the same reasoning that put `price_option_with_sabr` there.
+
+### Sanity checks — all three pass
+
+1. **Zero-return scenario reprices to today's price.** 2023-04-19 had a +0.0000% return;
+   scenario price $6.639087 against base $6.639087, P&L **exactly $0.000000**.
+2. **P&L monotone in the underlying move.** A long put must have P&L decreasing in spot —
+   holds across all 250 scenarios.
+3. **The P&L is convex**, which is the entire reason for full revaluation:
+
+| Move | P&L down | P&L up | Sum |
+|---|---|---|---|
+| 0.5% | +0.894788 | −0.772707 | +0.122080 |
+| 1.0% | +1.930181 | −1.440300 | +0.489880 |
+| 2.0% | +4.500072 | −2.518551 | +1.981521 |
+| 3.0% | +7.851610 | −3.332826 | +4.518784 |
+
+A linear position sums to exactly zero on every row. The positive sums are gamma.
+
+### What the forbidden shortcut would have cost
+
+Delta −0.350823, gamma +0.021615, both taken from the **full** chain including SABR's
+response — deliberately the most favourable version of the shortcut.
+
+| | Mean error | Max error |
+|---|---|---|
+| Delta only | $0.166302 | **$1.166583** |
+| Delta + gamma | $0.017813 | **$0.237816** |
+
+On the single worst scenario the delta+gamma shortcut gives −$2.534 against the true
+−$2.772: it **understates the worst-case loss by $0.238, or 8.6%**. On a $6.64 position the
+delta-only error peaks at 17.6% of the whole position value. That is what the filing's
+prohibition is protecting against.
+
+### Two sign errors of mine, both caught by checking against numbers
+
+**1. The direction our strike's volatility moves.** I wrote in the docstring that as spot
+falls the put "picks up vol from the steep left wing". That is backwards. The equity smile
+slopes down in strike and sticky-moneyness pins it to the forward, so:
+
+- market **rallies** → F rises → K/F **falls** → our strike slides deeper into the steep
+  left wing → **vol rises**
+- market **sells off** → F falls → K/F **rises** → our strike moves toward the smile
+  minimum → **vol falls**
+
+Our 475 put's volatility goes **up when the market goes up**. That reads backwards against
+"vol spikes in a selloff", but that intuition is about the whole surface level moving,
+which this model deliberately freezes.
+
+| Move | K/F | Our vol | Sticky-moneyness | Sticky-strike | Difference |
+|---|---|---|---|---|---|
+| −3% | 1.0225 | 10.26% | $14.49 | $15.15 | −$0.66 |
+| −1% | 1.0019 | 11.16% | $8.57 | $8.97 | −$0.40 |
+| +1% | 0.9821 | 12.41% | $5.20 | $4.78 | +$0.42 |
+| +3% | 0.9630 | 13.77% | $3.31 | $2.27 | +$1.04 |
+
+Sticky-moneyness **dampens** the P&L in both directions. A long put loses when the market
+rallies, so this is the **less conservative** convention for this position's VaR — the
+opposite of what I first wrote. Now reported as a table in the phase output.
+
+**2. The direction of the frozen-surface bias in the stress run.** I wrote that holding
+today's surface *understates* the stress. Also backwards. A long put is **long vega**, and
+its losses come from **rallies**. The worst stress scenario is 2020-03-13, a **+9.29%** day:
+
+| | Put price | Position P&L |
+|---|---|---|
+| Frozen surface (vol 17.98%) | $1.05 | **−$5.59** |
+| Vol +10 points | $4.74 | −$1.90 |
+| Vol +20 points | $9.96 | **+$3.32** |
+
+Through 2020 the surface sat far above today's, so freezing it **overstates** the loss tail
+for a long put. The stress figures are harsher than a true joint simulation would give.
+
+### Stress window comparison (2020, as requested)
+
+| | 2023 baseline | 2020 stress |
+|---|---|---|
+| Worst daily move | −2.00% | −11.51% |
+| Worst scenario P&L | −2.7719 | **−5.5885** |
+| Best scenario P&L | +4.5035 | +47.7675 |
+| P&L standard deviation | 1.3980 | **5.5767** |
+
+Same position, same surface, same method — only the return distribution differs. P&L
+volatility is 4× higher and the worst case twice as deep.
+
+### Decisions taken
+
+1. **Time to expiry HELD FIXED** at 49 days, per instruction. Decrementing would include
+   theta, a near-constant negative contribution to every scenario that would shift the
+   whole distribution down and inflate the VaR regardless of market direction. Holding T
+   fixed isolates pure market risk. One-line change if revisited.
+2. **Sticky-moneyness**, implemented by holding (alpha, beta, rho, nu) fixed and
+   re-evaluating SABR at the new forward. Quantified against sticky-strike above.
+3. **No vol-surface shock** — declined earlier. The scenario P&Ls therefore contain spot
+   risk and the smile's response to spot, but **no independent volatility risk**.
 
 ---
 

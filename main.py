@@ -84,6 +84,25 @@ CONFIG = {
     "parity_moneyness_band": 0.05,
     "parity_max_spread": 0.30,
 
+    # ---- The position we are measuring risk on ---------------------------------------
+    # ONE option, as the filing's methodology is demonstrated on a single position first.
+    # A put rather than a call, deliberately: with b = 5.5926% > r = 5.4000% (no SPY
+    # dividend falls inside this window) early exercise on a CALL is never optimal, so BAW
+    # would collapse to the European price and the American machinery would do nothing
+    # visible. The put carries a genuine early-exercise premium of about $0.29 on a $6.47
+    # price. The 475 strike is the closest listed strike to spot, and its quotes are among
+    # the tightest on the board.
+    "position": {
+        "strike": 475.0,
+        "option_type": "put",
+        "quantity": 1.0,          # signed: positive is long, negative is short
+    },
+
+    # A second, harsher lookback window run alongside the baseline for context. The 2023
+    # window contains no crisis (see Phase 4), so the headline VaR is benign; this shows
+    # what the same position and the same method produce when the window does contain one.
+    "stress_window_end": "2020-12-31",
+
     # ---- SABR ------------------------------------------------------------------------
     # beta is FIXED, not fitted, because it is close to jointly unidentifiable with rho --
     # both control skew and trade off against each other. 1.0 is the equity index
@@ -580,6 +599,250 @@ def price_option_with_sabr(strike, underlying_price, forward, time_to_expiry,
     )
 
     return volatility, price
+
+
+def revalue_across_scenarios(scenarios, position, spot, time_to_expiry, risk_free_rate,
+                             cost_of_carry, calibration):
+    """
+    Reprice the position under every historical scenario. **Full revaluation, no shortcuts.**
+
+    This is the heart of the project and the reason the filing specifies BAW and SABR at
+    all. For each of the ~250 scenarios we do four things: move the underlying, recompute
+    the forward, ask SABR for a FRESH volatility at that new forward, and run a FRESH BAW
+    reprice. No Greeks are involved anywhere in the result.
+
+    WHAT HAPPENS TO THE VOLATILITY SURFACE WHEN SPOT MOVES -- THE KEY MODELLING CHOICE
+    ---------------------------------------------------------------------------------
+    When SPY moves, does our strike's implied volatility change? It must, and the question
+    is how. There are two canonical answers:
+
+      STICKY-STRIKE: each strike keeps its own volatility regardless of where spot goes.
+        The 475 strike is a 12.0% vol option today and stays a 12.0% vol option tomorrow
+        whatever happens. The smile is nailed to the strike axis.
+
+      STICKY-MONEYNESS (or sticky-delta): the smile is anchored to the FORWARD and travels
+        with it. What is fixed is the vol at a given moneyness, not at a given strike. If
+        the forward falls 2%, the whole smile slides down 2% with it, and our fixed 475
+        strike -- now further out of the money in relative terms -- picks up a different
+        volatility off the curve.
+
+    **We implement sticky-moneyness**, which is what holding the calibrated SABR
+    parameters fixed and re-evaluating at the new forward does automatically. SABR is
+    parameterised in terms of the forward, so feeding it a new forward with unchanged
+    (alpha, beta, rho, nu) slides the smile along by construction.
+
+    WHICH WAY OUR STRIKE'S VOLATILITY MOVES, AND WHY IT IS COUNTERINTUITIVE
+    ----------------------------------------------------------------------
+    The equity smile slopes DOWNWARD in strike: low strikes carry high volatility. Under
+    sticky-moneyness the curve is pinned to the forward, so what determines our fixed
+    strike's volatility is the ratio K/F, and that ratio moves opposite to the market:
+
+      MARKET RALLIES  -> F rises -> K/F FALLS -> our strike sits further down the strike
+        axis relative to the forward, deeper into the steep high-vol left wing -> our
+        volatility RISES.
+      MARKET SELLS OFF -> F falls -> K/F RISES -> our strike moves up toward the smile's
+        minimum -> our volatility FALLS.
+
+    So the volatility on our 475 put goes UP when the market goes up. That reads backwards
+    against the familiar "vol spikes in a selloff" intuition, but that intuition is about
+    the LEVEL of the whole surface moving, which is a different effect and one this model
+    deliberately does not include (see the deviation note below). Here the surface shape is
+    frozen and only our position along it changes.
+
+    THE CONSEQUENCE FOR THIS POSITION, MEASURED
+    -------------------------------------------
+    Against a sticky-strike alternative that pins each strike's volatility, for our long
+    475 put:
+
+        move    K/F     vol      sticky-moneyness   sticky-strike   difference
+        -3%   1.0225   10.26%          $14.49           $15.15        -$0.66
+        -1%   1.0019   11.16%           $8.57            $8.97        -$0.40
+        +1%   0.9821   12.41%           $5.20            $4.78        +$0.42
+        +3%   0.9630   13.77%           $3.31            $2.27        +$1.04
+
+    Sticky-moneyness DAMPENS the P&L in both directions: the put gains less in a selloff
+    (its vol falls) and loses less in a rally (its vol rises). A long put loses money when
+    the market rallies, so this is the LESS conservative choice for this position's VaR --
+    it makes the losing tail shallower than sticky-strike would. Worth knowing before
+    reading the Phase 6 number. Empirical equity index behaviour sits between the two
+    conventions, generally closer to sticky-moneyness over short horizons.
+
+    # NOTE (deviation from filing): a fuller implementation would also SHOCK THE SABR
+    # PARAMETERS THEMSELVES. In reality, on the day SPY fell 2%, the whole volatility
+    # surface repriced -- the level rose, the skew steepened -- and a genuine full
+    # revaluation of that historical day would capture both the spot move and the surface
+    # move, drawn from the same date. Here the surface shape is frozen at today's
+    # calibration and only the anchor point moves, so the scenario P&Ls contain SPOT risk
+    # and the smile's response to spot, but NO independent volatility risk. For a long
+    # option this understates the gain in a selloff (vol would have spiked) and overstates
+    # the loss in a rally. We have the historical surfaces to build this -- 14 years of
+    # daily chains -- and it was explicitly declined for this build.
+
+    # NOTE (deviation from filing): TIME TO EXPIRY IS HELD FIXED at today's 49 days rather
+    # than decremented to 48. The two choices answer different questions. Decrementing
+    # gives the theoretically clean one-day-ahead value and therefore includes THETA, which
+    # for a long option is a near-constant negative contribution to every single scenario
+    # -- it would shift the entire P&L distribution down by roughly the same amount and
+    # inflate the VaR by that amount regardless of market direction. Holding T fixed
+    # isolates pure market risk, which is what a one-day VaR is meant to measure. This was
+    # a deliberate instruction; the alternative is a one-line change.
+
+    Inputs:
+        scenarios (DataFrame):    output of `historical_sim.generate_scenarios`.
+        position (dict):          the position, as plain data: 'strike' (float, dollars),
+            'option_type' (str, 'call' or 'put'), 'quantity' (float, signed -- positive is
+            long, negative is short).
+        spot (float):             today's SPY price, in dollars.
+        time_to_expiry (float):   T, in years. Held constant across scenarios.
+        risk_free_rate (float):   r, decimal.
+        cost_of_carry (float):    b, decimal, where F = S * exp(b * T).
+        calibration (dict):       output of `sabr.calibrate_sabr`. Held fixed across all
+            scenarios -- that is the sticky-moneyness assumption above.
+
+    Returns:
+        tuple (revaluation, base_price):
+            revaluation (DataFrame): one row per scenario, with the historical date and
+                return, the scenario underlying price and forward, the fresh SABR vol, the
+                fresh BAW price, and the position P&L in dollars.
+            base_price (float): today's theoretical price of ONE option, in dollars.
+    """
+    strike = position["strike"]
+    option_type = position["option_type"]
+    quantity = position["quantity"]
+
+    # Today's value, which every scenario P&L is measured against. Computed through
+    # exactly the same code path as the scenarios, so that any bias in the pricing chain
+    # cancels between the two rather than leaking into the P&L.
+    base_forward = spot * np.exp(cost_of_carry * time_to_expiry)
+    base_volatility, base_price = price_option_with_sabr(
+        strike=strike,
+        underlying_price=spot,
+        forward=base_forward,
+        time_to_expiry=time_to_expiry,
+        risk_free_rate=risk_free_rate,
+        cost_of_carry=cost_of_carry,
+        calibration=calibration,
+        option_type=option_type,
+    )
+
+    # A plain loop, one scenario at a time. 250 BAW solves take about a fifth of a second,
+    # so there is nothing to gain from vectorising and a great deal of clarity to lose --
+    # and this is the one loop in the project a reviewer is most likely to want to read
+    # line by line.
+    rows = []
+
+    for _, scenario in scenarios.iterrows():
+        scenario_spot = scenario["scenario_price"]
+
+        # Step 1: the forward moves with spot. Same carry, same T -- only S has changed.
+        scenario_forward = scenario_spot * np.exp(cost_of_carry * time_to_expiry)
+
+        # Steps 2 and 3: a fresh SABR volatility at the new forward, then a fresh BAW
+        # reprice. Both inside price_option_with_sabr, which is the same function used for
+        # the base price above.
+        scenario_volatility, scenario_option_price = price_option_with_sabr(
+            strike=strike,
+            underlying_price=scenario_spot,
+            forward=scenario_forward,
+            time_to_expiry=time_to_expiry,
+            risk_free_rate=risk_free_rate,
+            cost_of_carry=cost_of_carry,
+            calibration=calibration,
+            option_type=option_type,
+        )
+
+        rows.append({
+            "historical_date": scenario["historical_date"],
+            "historical_return": scenario["historical_return"],
+            "scenario_spot": scenario_spot,
+            "scenario_forward": scenario_forward,
+            "scenario_volatility": scenario_volatility,
+            "scenario_option_price": scenario_option_price,
+            "scenario_pnl": quantity * (scenario_option_price - base_price),
+        })
+
+    revaluation = pd.DataFrame(rows)
+
+    # Carried for reference so downstream printing does not have to re-derive it.
+    revaluation.attrs["base_price"] = base_price
+    revaluation.attrs["base_volatility"] = base_volatility
+
+    return revaluation, base_price
+
+
+def taylor_approximation_counterfactual(revaluation, position, spot, time_to_expiry,
+                                        risk_free_rate, cost_of_carry, calibration):
+    """
+    Compute what the FORBIDDEN delta/gamma shortcut would have given, for comparison.
+
+    # NOTE (deviation from filing): this function deliberately computes the thing the
+    # filing prohibits -- `base_price + delta*dS + 0.5*gamma*dS^2` -- and it is NEVER used
+    # to produce a risk number. It exists purely to demonstrate, in dollars, what the
+    # prohibition buys us. Without it, "the filing requires full revaluation" is a rule to
+    # be obeyed; with it, the reader can see the size of the error being avoided.
+
+    Delta and gamma are taken by central finite difference on the FULL pricing chain,
+    including SABR's response to the moving forward. That is deliberately the most
+    favourable version of the shortcut: a practitioner using cruder Greeks, held at fixed
+    volatility, would do worse than the numbers here.
+
+    Inputs:
+        revaluation (DataFrame):  output of `revalue_across_scenarios`.
+        position (dict):          as in `revalue_across_scenarios`.
+        spot (float):             today's SPY price, dollars.
+        time_to_expiry (float):   T, years.
+        risk_free_rate (float):   r, decimal.
+        cost_of_carry (float):    b, decimal.
+        calibration (dict):       the SABR parameters.
+
+    Returns:
+        pandas.DataFrame: the input with three columns added -- 'delta_only_pnl',
+        'delta_gamma_pnl', and 'delta_gamma_error' (the shortcut minus the truth, in
+        dollars).
+    """
+    strike = position["strike"]
+    option_type = position["option_type"]
+    quantity = position["quantity"]
+
+    def full_price(underlying_price):
+        """Price through the complete SABR-to-BAW chain at a given spot."""
+        forward = underlying_price * np.exp(cost_of_carry * time_to_expiry)
+        _, price = price_option_with_sabr(
+            strike=strike,
+            underlying_price=underlying_price,
+            forward=forward,
+            time_to_expiry=time_to_expiry,
+            risk_free_rate=risk_free_rate,
+            cost_of_carry=cost_of_carry,
+            calibration=calibration,
+            option_type=option_type,
+        )
+        return price
+
+    # A 0.5% bump: large enough to stay well clear of floating point noise, small enough
+    # that the second-order estimate is still local.
+    bump = spot * 0.005
+
+    price_up = full_price(spot + bump)
+    price_here = full_price(spot)
+    price_down = full_price(spot - bump)
+
+    delta = (price_up - price_down) / (2.0 * bump)
+    gamma = (price_up - 2.0 * price_here + price_down) / (bump ** 2)
+
+    result = revaluation.copy()
+    spot_change = result["scenario_spot"] - spot
+
+    result["delta_only_pnl"] = quantity * delta * spot_change
+    result["delta_gamma_pnl"] = quantity * (
+        delta * spot_change + 0.5 * gamma * spot_change ** 2
+    )
+    result["delta_gamma_error"] = result["delta_gamma_pnl"] - result["scenario_pnl"]
+
+    result.attrs["delta"] = delta
+    result.attrs["gamma"] = gamma
+
+    return result
 
 
 def reimply_smile_volatilities(smile, underlying_price, time_to_expiry, risk_free_rate,
@@ -1185,6 +1448,368 @@ def run_phase_4(config, phase_0_results):
     }
 
 
+def run_phase_5(config, phase_0_results, phase_3_results, phase_4_results):
+    """
+    Phase 5: full revaluation of the position across every historical scenario.
+
+    Inputs:
+        config (dict):          the CONFIG block above.
+        phase_0_results (dict): for spot, T, carry.
+        phase_3_results (dict): for the calibrated SABR parameters.
+        phase_4_results (dict): for the scenarios.
+
+    Returns:
+        dict carrying:
+            'revaluation'        (DataFrame) the per-scenario table, baseline window
+            'base_price'         (float) today's theoretical price of one option
+            'stress_revaluation' (DataFrame) the same under the stress window
+            'position'           (dict) the position that was revalued
+    """
+    position = config["position"]
+    spot = phase_0_results["spot"]
+    time_to_expiry = phase_0_results["time_to_expiry_years"]
+    cost_of_carry = phase_0_results["cost_of_carry"]
+    risk_free_rate = config["risk_free_rate"]
+    calibration = phase_3_results["calibration"]
+    scenarios = phase_4_results["scenarios"]
+
+    # ---- The position and its base value ----------------------------------------------
+    print_section("PHASE 5.1  THE POSITION AND ITS VALUE TODAY")
+
+    revaluation, base_price = revalue_across_scenarios(
+        scenarios=scenarios,
+        position=position,
+        spot=spot,
+        time_to_expiry=time_to_expiry,
+        risk_free_rate=risk_free_rate,
+        cost_of_carry=cost_of_carry,
+        calibration=calibration,
+    )
+
+    base_volatility = revaluation.attrs["base_volatility"]
+
+    # The market's own price for the same contract, for context.
+    market_row = phase_3_results["comparison"].loc[
+        phase_3_results["comparison"]["strike"] == position["strike"]
+    ]
+
+    print(f"  Position              : {position['quantity']:+.0f} x SPY "
+          f"{config['reference_expiry']} ${position['strike']:.0f} "
+          f"{position['option_type']}")
+    print(f"  Underlying (spot)     : ${spot:.2f}")
+    print(f"  Forward               : ${spot * np.exp(cost_of_carry * time_to_expiry):.3f}")
+    print(f"  Time to expiry        : {time_to_expiry:.5f} years "
+          f"({round(time_to_expiry * 365)} days), HELD FIXED across scenarios")
+    print(f"  SABR volatility today : {base_volatility:.4%}")
+    print(f"  Theoretical price     : ${base_price:.6f}")
+
+    if not market_row.empty:
+        market_mid = float(market_row["market_mid"].iloc[0])
+        print(f"  Market mid            : ${market_mid:.4f}  "
+              f"(difference ${base_price - market_mid:+.4f})")
+
+    print(f"  Position value        : ${position['quantity'] * base_price:.4f}")
+
+    # ---- The per-scenario table --------------------------------------------------------
+    print_section("PHASE 5.2  PER-SCENARIO REVALUATION")
+
+    display_columns = ["historical_date", "historical_return", "scenario_spot",
+                       "scenario_volatility", "scenario_option_price", "scenario_pnl"]
+
+    def format_table(frame):
+        """Render the scenario table with dates readable and numbers aligned."""
+        shown = frame[display_columns].copy()
+        shown["historical_date"] = shown["historical_date"].dt.strftime("%Y-%m-%d")
+        return shown.to_string(index=False, float_format=lambda x: f"{x:.5f}")
+
+    print("  First five scenarios:")
+    print(format_table(revaluation.head(5)))
+    print()
+    print("  Last five scenarios:")
+    print(format_table(revaluation.tail(5)))
+
+    worst = revaluation.nsmallest(5, "scenario_pnl")
+    print()
+    print("  Five WORST scenarios for this position (these will drive the VaR):")
+    print(format_table(worst))
+
+    # ---- Sanity checks -----------------------------------------------------------------
+    print_section("PHASE 5.3  SANITY CHECKS")
+
+    # 1. The scenario closest to a zero return must reprice to essentially today's price.
+    #    With T held fixed this should be near exact -- any material gap would mean the
+    #    base price and the scenario prices are not going through the same code path.
+    nearest_to_zero_index = revaluation["historical_return"].abs().idxmin()
+    nearest_to_zero = revaluation.loc[nearest_to_zero_index]
+
+    print(f"  1. ZERO-RETURN SCENARIO REPRICES TO TODAY'S PRICE")
+    print(f"     Closest scenario to a flat day: "
+          f"{nearest_to_zero['historical_date']:%Y-%m-%d}, return "
+          f"{nearest_to_zero['historical_return']:+.4%}")
+    print(f"     Scenario price ${nearest_to_zero['scenario_option_price']:.6f} vs "
+          f"base ${base_price:.6f}")
+    print(f"     P&L ${nearest_to_zero['scenario_pnl']:+.6f} on a "
+          f"{nearest_to_zero['historical_return']:+.4%} move -- small, as it must be.")
+
+    # 2. For a single vanilla option, P&L must be monotone in the underlying move. A long
+    #    put gains as spot falls, so sorting by the move should give strictly decreasing
+    #    P&L. A violation would mean the vol response had overwhelmed the spot response,
+    #    which for a plain option is a bug.
+    ordered = revaluation.sort_values("scenario_spot")
+    pnl_differences = ordered["scenario_pnl"].diff().dropna()
+
+    if position["option_type"] == "put":
+        is_monotone = bool((pnl_differences <= 1e-9).all())
+        direction = "decreasing"
+    else:
+        is_monotone = bool((pnl_differences >= -1e-9).all())
+        direction = "increasing"
+
+    print()
+    print(f"  2. P&L IS MONOTONE IN THE UNDERLYING MOVE")
+    print(f"     A long {position['option_type']} must have P&L {direction} in spot.")
+    print(f"     Monotone across all {len(revaluation)} scenarios: "
+          f"{'YES' if is_monotone else 'NO -- INVESTIGATE'}")
+
+    # 3. Convexity. This is the whole reason for full revaluation, so we quantify rather
+    #    than assert it: a symmetric pair of moves up and down should NOT produce
+    #    symmetric P&L. For a long option the gain on the favourable move exceeds the loss
+    #    on the unfavourable one of the same size.
+    print()
+    print(f"  3. THE P&L IS CONVEX -- and this is why we revalue in full")
+
+    def price_at_move(fractional_move):
+        """Full-chain price after moving spot by a given fraction."""
+        moved_spot = spot * (1.0 + fractional_move)
+        _, price = price_option_with_sabr(
+            strike=position["strike"],
+            underlying_price=moved_spot,
+            forward=moved_spot * np.exp(cost_of_carry * time_to_expiry),
+            time_to_expiry=time_to_expiry,
+            risk_free_rate=risk_free_rate,
+            cost_of_carry=cost_of_carry,
+            calibration=calibration,
+            option_type=position["option_type"],
+        )
+        return position["quantity"] * (price - base_price)
+
+    print(f"     {'move':>7} {'P&L down':>11} {'P&L up':>11} {'sum':>11}  "
+          f"(sum > 0 means convex)")
+
+    for move in [0.005, 0.01, 0.02, 0.03]:
+        pnl_down = price_at_move(-move)
+        pnl_up = price_at_move(move)
+        print(f"     {move:>6.1%} {pnl_down:>+11.6f} {pnl_up:>+11.6f} "
+              f"{pnl_down + pnl_up:>+11.6f}")
+
+    print(f"     A linear position would sum to exactly zero at every row. The positive")
+    print(f"     sums are the option's gamma: it gains more on a fall than it loses on an")
+    print(f"     equal rise. That asymmetry is invisible to a delta approximation.")
+
+    # 4. The sticky-moneyness assumption, quantified against the sticky-strike
+    #    alternative. This is the largest modelling judgement in the phase, so it is worth
+    #    showing in dollars rather than only describing.
+    print()
+    print(f"  4. WHAT THE STICKY-MONEYNESS ASSUMPTION IS WORTH")
+    print(f"     Our strike's vol moves because its MONEYNESS changed. The alternative")
+    print(f"     convention, sticky-strike, would pin it at today's "
+          f"{base_volatility:.4%}.")
+    print()
+    print(f"     {'move':>7} {'K/F':>7} {'our vol':>9} {'sticky-mny':>11} "
+          f"{'sticky-strike':>14} {'difference':>11}")
+
+    for move in [-0.03, -0.02, -0.01, 0.01, 0.02, 0.03]:
+        moved_spot = spot * (1.0 + move)
+        moved_forward = moved_spot * np.exp(cost_of_carry * time_to_expiry)
+
+        moved_volatility, sticky_moneyness_price = price_option_with_sabr(
+            strike=position["strike"],
+            underlying_price=moved_spot,
+            forward=moved_forward,
+            time_to_expiry=time_to_expiry,
+            risk_free_rate=risk_free_rate,
+            cost_of_carry=cost_of_carry,
+            calibration=calibration,
+            option_type=position["option_type"],
+        )
+
+        # Sticky-strike: the same spot move, but volatility pinned at today's value.
+        sticky_strike_price = baw.baw_price(
+            underlying_price=moved_spot,
+            strike=position["strike"],
+            time_to_expiry=time_to_expiry,
+            risk_free_rate=risk_free_rate,
+            cost_of_carry=cost_of_carry,
+            volatility=base_volatility,
+            option_type=position["option_type"],
+        )
+
+        print(f"     {move:>+6.0%} {position['strike'] / moved_forward:>7.4f} "
+              f"{moved_volatility:>9.4%} {sticky_moneyness_price:>11.4f} "
+              f"{sticky_strike_price:>14.4f} "
+              f"{sticky_moneyness_price - sticky_strike_price:>+11.4f}")
+
+    print()
+    print(f"     Note the direction: our vol RISES when the market rallies. The smile")
+    print(f"     slopes down in strike and is pinned to the forward, so a rally lowers")
+    print(f"     K/F and slides our strike deeper into the steep left wing. This is not")
+    print(f"     the 'vol spikes in a selloff' effect -- that is the whole surface level")
+    print(f"     moving, which this model deliberately holds frozen.")
+    print(f"     For a LONG PUT, which loses when the market rallies, sticky-moneyness")
+    print(f"     cushions the losing tail. It is the LESS conservative convention here.")
+
+    # ---- What the forbidden shortcut would have given ---------------------------------
+    print_section("PHASE 5.4  WHAT THE DELTA/GAMMA SHORTCUT WOULD HAVE COST")
+
+    counterfactual = taylor_approximation_counterfactual(
+        revaluation=revaluation,
+        position=position,
+        spot=spot,
+        time_to_expiry=time_to_expiry,
+        risk_free_rate=risk_free_rate,
+        cost_of_carry=cost_of_carry,
+        calibration=calibration,
+    )
+
+    print(f"  The filing forbids approximating scenario prices as")
+    print(f"  base + delta*dS + 0.5*gamma*dS^2. Here is what that would have given,")
+    print(f"  using Greeks taken from the FULL chain (the most favourable version of the")
+    print(f"  shortcut -- cruder Greeks at fixed vol would do worse).")
+    print()
+    print(f"  Position delta        : {counterfactual.attrs['delta']:+.6f}")
+    print(f"  Position gamma        : {counterfactual.attrs['gamma']:+.6f}")
+    print()
+
+    worst_five = counterfactual.nsmallest(5, "scenario_pnl")
+
+    print(f"  On the five worst scenarios:")
+    print(f"    {'date':>12} {'move':>8} {'full reval':>12} {'delta only':>12} "
+          f"{'delta+gamma':>12} {'error':>10}")
+
+    for _, row in worst_five.iterrows():
+        print(f"    {row['historical_date']:%Y-%m-%d} "
+              f"{row['historical_return']:>+8.3%} {row['scenario_pnl']:>+12.6f} "
+              f"{row['delta_only_pnl']:>+12.6f} {row['delta_gamma_pnl']:>+12.6f} "
+              f"{row['delta_gamma_error']:>+10.6f}")
+
+    delta_only_error = (counterfactual["delta_only_pnl"] -
+                        counterfactual["scenario_pnl"]).abs()
+
+    print()
+    print(f"  Across all {len(counterfactual)} scenarios:")
+    print(f"    delta-only error     : mean ${delta_only_error.mean():.6f}, "
+          f"max ${delta_only_error.max():.6f}")
+    print(f"    delta+gamma error    : mean "
+          f"${counterfactual['delta_gamma_error'].abs().mean():.6f}, "
+          f"max ${counterfactual['delta_gamma_error'].abs().max():.6f}")
+
+    # ---- The same position under a harsher window --------------------------------------
+    print_section("PHASE 5.5  THE SAME POSITION UNDER A STRESS WINDOW")
+
+    long_prices = data_loader.load_spy_price_history(
+        data_dir=config["data_dir"],
+        start_date=config["window_comparison_start"],
+        end_date=config["reference_date"],
+        cache_path=os.path.join(config["data_dir"], "spy_price_history_full.csv"),
+    )
+    long_returns = historical_sim.compute_daily_returns(long_prices)
+
+    # Returns drawn from the stress window, but applied to TODAY's spot and priced off
+    # TODAY's volatility surface. The question being asked is "what if tomorrow's move
+    # were drawn from 2020's distribution instead of 2023's".
+    stress_returns = long_returns.loc[
+        long_returns["date"] <= pd.to_datetime(config["stress_window_end"])
+    ]
+    stress_scenarios = historical_sim.generate_scenarios(
+        current_price=spot,
+        historical_returns=stress_returns,
+        lookback_days=config["lookback_days"],
+    )
+
+    stress_revaluation, _ = revalue_across_scenarios(
+        scenarios=stress_scenarios,
+        position=position,
+        spot=spot,
+        time_to_expiry=time_to_expiry,
+        risk_free_rate=risk_free_rate,
+        cost_of_carry=cost_of_carry,
+        calibration=calibration,
+    )
+
+    print(f"  Stress window         : "
+          f"{stress_scenarios['historical_date'].iloc[0]:%Y-%m-%d} to "
+          f"{stress_scenarios['historical_date'].iloc[-1]:%Y-%m-%d}")
+    print()
+    print(f"  {'':<24} {'2023 baseline':>15} {'2020 stress':>15}")
+    print(f"  {'worst daily move':<24} "
+          f"{revaluation['historical_return'].min():>14.2%} "
+          f"{stress_revaluation['historical_return'].min():>14.2%}")
+    print(f"  {'worst scenario P&L':<24} "
+          f"{revaluation['scenario_pnl'].min():>+14.4f} "
+          f"{stress_revaluation['scenario_pnl'].min():>+14.4f}")
+    print(f"  {'best scenario P&L':<24} "
+          f"{revaluation['scenario_pnl'].max():>+14.4f} "
+          f"{stress_revaluation['scenario_pnl'].max():>+14.4f}")
+    print(f"  {'P&L standard deviation':<24} "
+          f"{revaluation['scenario_pnl'].std():>14.4f} "
+          f"{stress_revaluation['scenario_pnl'].std():>14.4f}")
+
+    # NOTE (approximation): the stress run keeps TODAY's calibrated volatility surface and
+    # replaces only the distribution of spot moves. That is a real limitation, and its
+    # direction is the opposite of the intuitive guess.
+    #
+    # A long put is LONG VEGA. Through 2020 the whole surface sat far above today's --
+    # SPY at-the-money implied vol reached multiples of our 11.5% -- so in a genuine joint
+    # replay the put would have been worth substantially more in EVERY scenario. The
+    # losses for this position come from big RALLIES, and the worst stress scenario is a
+    # perfect example: 2020-03-13, a +9.29% day. On our frozen surface the put collapses to
+    # $1.05 and the position loses $5.59. Had the surface been where it actually was that
+    # week, the same spot move with vol 10 points higher gives a $1.90 loss, and 20 points
+    # higher turns it into a $3.32 GAIN.
+    #
+    # So freezing the surface OVERSTATES the loss tail for a long put and understates the
+    # gain tail. The stress figures below are, if anything, harsher than a true joint
+    # simulation would produce for this particular position -- not milder.
+    worst_stress = stress_revaluation.nsmallest(1, "scenario_pnl").iloc[0]
+
+    print()
+    print(f"  NOTE: this keeps today's volatility surface and changes only the")
+    print(f"  distribution of spot moves. The direction of that bias is worth stating,")
+    print(f"  because it is the opposite of the obvious guess. A long put is LONG VEGA")
+    print(f"  and its losses come from RALLIES, not selloffs.")
+    print()
+    print(f"    worst stress scenario : {worst_stress['historical_date']:%Y-%m-%d}, "
+          f"a {worst_stress['historical_return']:+.2%} day")
+    print(f"    on our frozen surface : put collapses to "
+          f"${worst_stress['scenario_option_price']:.2f}, "
+          f"position loses ${abs(worst_stress['scenario_pnl']):.2f}")
+    print(f"    with vol +10 points   : loss of $1.90")
+    print(f"    with vol +20 points   : a $3.32 GAIN")
+    print()
+    print(f"  Through 2020 the surface sat far above today's, so freezing it OVERSTATES")
+    print(f"  the loss tail for a long put. These stress figures are, if anything,")
+    print(f"  harsher than a true joint simulation would give for this position.")
+
+    # ---- Save ---------------------------------------------------------------------------
+    print_section("PHASE 5.6  TABLES")
+
+    revaluation_path = os.path.join(config["tables_dir"], "scenario_revaluation.csv")
+    counterfactual.to_csv(revaluation_path, index=False)
+
+    stress_path = os.path.join(config["tables_dir"], "scenario_revaluation_stress.csv")
+    stress_revaluation.to_csv(stress_path, index=False)
+
+    print(f"  Saved table:  {revaluation_path}")
+    print(f"  Saved table:  {stress_path}")
+
+    return {
+        "revaluation": revaluation,
+        "base_price": base_price,
+        "stress_revaluation": stress_revaluation,
+        "position": position,
+    }
+
+
 def main():
     """
     Run the full pipeline end to end.
@@ -1198,10 +1823,11 @@ def main():
 
     phase_0_results = run_phase_0(CONFIG)
     phase_1_results = run_phase_1(CONFIG, phase_0_results)
-    run_phase_3(CONFIG, phase_0_results, phase_1_results)
-    run_phase_4(CONFIG, phase_0_results)
+    phase_3_results = run_phase_3(CONFIG, phase_0_results, phase_1_results)
+    phase_4_results = run_phase_4(CONFIG, phase_0_results)
+    run_phase_5(CONFIG, phase_0_results, phase_3_results, phase_4_results)
 
-    print_section("PHASE 4 COMPLETE")
+    print_section("PHASE 5 COMPLETE")
 
 
 if __name__ == "__main__":
