@@ -828,3 +828,38 @@ Phase 8.
 - Every function gets a docstring with units; every non-trivial block gets a comment
   explaining the *finance*, not the syntax. Flag approximations with `# NOTE`.
 - **Full revaluation always.** Never `price + delta*dS + 0.5*gamma*dS²`.
+
+---
+
+## Version control
+
+**One commit per phase.** At the end of every phase, before asking for approval to
+proceed, commit the phase's work with a message summarising what it built and its key
+finding. This file is the source of truth for those messages.
+
+The commit goes *after* the phase's work is finished and verified, and *before* the
+PHASE COMPLETE block is posted. Nothing is pushed to a remote yet — that will be set up
+separately.
+
+`.gitignore` excludes the raw `data/*.parquet` vendor files (~600 MB, and not ours to
+redistribute), the derived `data/*.csv` caches, and `__pycache__`. The `outputs/`
+directory **is** committed, so the repository stays reviewable by someone who does not
+have the dataset. `README.md` explains where to obtain it.
+
+### A caveat on the Phase 0–5 commits
+
+Those six commits were created retroactively, after Phase 5 was finished, because the
+project was built before the repository existed. They are a reconstruction: each contains
+the code introduced up to and including that phase, with anything from later phases
+removed. Every one was verified to run `python3 main.py` end to end from a clean checkout,
+and the standalone modules were verified at the commit that introduced them.
+
+Two known artifacts of that reconstruction, neither of which affects correctness:
+
+- Bug fixes made in a later phase to an earlier file appear in the earlier commit. For
+  example the two `baw.py` fixes found in Phase 3 are present in the Phase 2 commit, since
+  un-fixing them would mean committing code known to be broken.
+- The consolidated assumptions table at the end of this file is not truncated per phase,
+  so early commits carry a few forward references in that table.
+
+From Phase 6 onward the commits are genuine, made at the time.
