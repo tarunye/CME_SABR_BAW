@@ -4,7 +4,7 @@ Running record of what has been built, decided, and deferred. Append-only: each 
 a section, nothing earlier gets rewritten. If you are picking this project up cold, read
 this file top to bottom and you will know exactly where things stand.
 
-**Current status: Phase 1 complete. Awaiting approval for Phase 2.**
+**Current status: Phase 2 complete. Awaiting approval for Phase 3.**
 
 ---
 
@@ -264,6 +264,117 @@ would produce parameters that jump around day to day while the fit quality never
 4. **Scalar function plus an explicit loop wrapper**, not a vectorised implementation.
    The brief prioritises readability, and the `z/x(z)` branch is far clearer as a plain
    `if`. Performance is irrelevant at this scale.
+
+---
+
+## PHASE 2 — BAW pricing engine ✅ complete, awaiting approval
+
+### What was built
+
+`baw.py`. No SABR involvement — volatility is just an input argument in this phase.
+
+- `black_scholes_price` — generalised Black-Scholes-Merton with cost of carry `b`, so it
+  doubles as Black-76 when `b = 0`.
+- `baw_price` — the quadratic approximation: European price plus early-exercise premium.
+- `solve_critical_price` — Newton-Raphson from the BAW seed for the exercise boundary,
+  with an iteration cap and a hard error on non-convergence.
+- `binomial_american_price` — a Cox-Ross-Rubinstein lattice. **Validation reference only**,
+  never called by the pricing pipeline.
+- Nine validation checks, run by `python3 baw.py`.
+
+`main.py` is unchanged: the pricer is not wired into the pipeline until Phase 3.
+
+### Validation results — all nine pass
+
+| Test | Result |
+|---|---|
+| 1. European put-call parity | Worst error **2.8e-14** across 6 cases |
+| 2. American call = European when `b = r` | Worst spurious premium **exactly 0.0** across 5 cases |
+| 3. American ≥ European and ≥ intrinsic | **0 violations in 1,350** grid points |
+| 4. BAW vs binomial, stress grid | Worst abs error **$0.0599** (tol $0.10); worst rel 2.01% |
+| 4b. BAW vs binomial, SPY regime | Worst abs error **$0.1439** (tol $0.20) |
+| 4c. P&L error propagation | Informational — see below |
+| 5. Monotonicity | 10 sequences, all correct |
+| 6. Critical exercise prices | Correct side of strike, move away from it as vol rises |
+| 7. SPY reference case | Informational |
+
+Test 2 is the sharpest test of a BAW implementation and it passes to *exactly* zero, not
+merely to tolerance.
+
+### BAW's approximation error, measured honestly
+
+This is the phase's most important finding and it constrains everything downstream.
+
+**Calls are exact in our regime.** With `b = 5.5926% > r = 5.4000%`, early exercise on a
+call is never optimal, `baw_price` returns the European price, and the lattice agrees to
+0.02%. There is no premium to get wrong.
+
+**Puts carry real error, with a sign that flips with moneyness.** At our reference strike:
+
+| Strike | True premium | BAW premium | BAW price | Lattice | Abs err | Rel err |
+|---|---|---|---|---|---|---|
+| 450 (OTM) | $0.0167 | $0.0362 | 0.635978 | 0.616456 | 0.0195 | **3.17%** |
+| 475 (ATM) | $0.3069 | $0.2914 | 6.467076 | 6.482558 | 0.0155 | 0.24% |
+| 500 (ITM) | — | — | 24.690000 | 24.702464 | 0.0125 | 0.05% |
+
+BAW **understates** the ATM put premium (recovering ~95%) and **overstates** it out of the
+money (by more than 2×). The absolute errors are small; the OTM relative error is large
+only because the denominator is small.
+
+**The error does not cancel in the P&L — it amplifies.** I assumed it would largely cancel
+in the scenario-minus-base subtraction, measured it, and was wrong:
+
+| Shock | BAW P&L | True P&L | P&L error | % of P&L |
+|---|---|---|---|---|
+| −3% | 8.558949 | 8.644133 | −0.085185 | 0.985% |
+| −2% | 5.176196 | 5.236558 | −0.060362 | 1.153% |
+| −1% | 2.330060 | 2.358205 | −0.028145 | **1.193%** |
+| +1% | −1.849299 | −1.869590 | +0.020290 | 1.085% |
+| +3% | −4.319769 | −4.358010 | +0.038241 | 0.877% |
+
+Worst P&L error $0.0852 against a price-level error of $0.0155 — **5.5× larger in the P&L
+than in the price**, because the error varies with spot and changes sign with moneyness.
+
+**Practical consequence: expect roughly 1% error in the scenario P&Ls, and therefore in the
+Phase 6 VaR, purely from using BAW rather than a lattice.** That is acceptable for a
+methodology replication — and the filing specifies BAW, so it is the intended behaviour —
+but it is a real precision floor and should be stated in the Phase 8 README.
+
+### A note on how the tolerances were set
+
+I initially gated tests 4 and 4b on *relative* error and they failed. Rather than simply
+loosening the threshold until they passed, I verified against a 40,000-step lattice that
+the errors were BAW's documented behaviour and not a bug: the error is smallest at the
+money, peaks just below the exercise boundary, and vanishes past it. The error profile for
+a call at σ=40%, T=0.25:
+
+| S | S/S* | Abs err | Rel err |
+|---|---|---|---|
+| 100 | 0.732 | 0.0035 | 0.047% |
+| 120 | 0.878 | 0.0598 | 0.281% |
+| 125 | 0.915 | 0.0700 | 0.273% |
+| 140 | 1.024 | 0.0000 | 0.000% |
+
+The tests were then restructured to gate on **absolute** dollar error, on the grounds that
+the deliverable is a dollar VaR, with relative error reported but not gated. Correctness of
+the implementation is established by tests 1, 2, 3, 5 and 6 — all exact structural
+properties — not by tests 4/4b, which measure the accuracy of the *method*.
+
+### Decisions taken
+
+1. **`cost_of_carry` is a required argument with no default**, contrary to the brief's
+   suggestion of defaulting it for SPY. Any hardcoded default would conflict with the `b`
+   derived from the market in Phase 0 (5.5926%), and a silently wrong carry produces
+   prices that look entirely plausible.
+2. **No literature benchmark table was transcribed.** The brief asked for values from the
+   BAW 1987 paper or Haug's book. I could not verify those from this environment, and a
+   mis-remembered reference number would make the test worse than useless — it would
+   "validate" the pricer against fiction. The substitute is a convergent binomial lattice,
+   which is the same methodology BAW used to assess their own approximation, and covers a
+   whole grid rather than a handful of points. Easy to add if you have the tables.
+3. **`T <= 0` and `sigma <= 0` raise rather than returning intrinsic value.** Both have
+   well-defined limits, but silently returning them would hide a caller feeding an expired
+   option into a pricing loop.
 
 ---
 
