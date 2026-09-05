@@ -4,7 +4,7 @@ Running record of what has been built, decided, and deferred. Append-only: each 
 a section, nothing earlier gets rewritten. If you are picking this project up cold, read
 this file top to bottom and you will know exactly where things stand.
 
-**Current status: Phase 5 complete. Awaiting approval for Phase 6.**
+**Current status: Phase 6 complete. Awaiting approval for Phase 7.**
 
 ---
 
@@ -30,6 +30,7 @@ Built in nine phases (0-8), one at a time, stopping for written approval after e
 | `sabr.py` | Hagan et al. (2002) implied vol expansion and least-squares calibration | Phase 1 |
 | `baw.py` | Barone-Adesi & Whaley American pricer, European baseline, critical-price solver, binomial reference, and the validation suite | Phase 2 |
 | `historical_sim.py` | Daily returns, scenario generation, return-sample statistics, tail and lookback-window diagnostics | Phase 4 |
+| `var.py` | 99% VaR by explicit interpolation between order statistics, expected shortfall, and the rank-convention comparison | Phase 6 |
 | `plots.py` | One function per figure, all saving to `outputs/figures/` | Phase 0 |
 | `main.py` | `CONFIG` block (every assumption, with sources) and the phase runners | Phase 0 |
 | `data/spy_eod_YYYY.parquet` | Raw vendor data, 2010-2023 (supplied, not generated) | — |
@@ -38,8 +39,9 @@ Built in nine phases (0-8), one at a time, stopping for written approval after e
 | `outputs/tables/` | All `.csv` output | Phase 0 |
 
 **Run everything with `python3 main.py`.** Individual modules with a standalone block can
-also be run alone: `python3 sabr.py`, `python3 baw.py` (the latter takes ~30s — it runs
-thousands of binomial lattices — and is not part of the pipeline).
+also be run alone: `python3 sabr.py`, `python3 historical_sim.py`, `python3 var.py`, and
+`python3 baw.py` (the last takes ~30s — it runs thousands of binomial lattices — and is
+not part of the pipeline).
 
 ---
 
@@ -751,6 +753,101 @@ volatility is 4× higher and the worst case twice as deep.
 
 ---
 
+## PHASE 6 — VaR calculation ✅ complete, awaiting approval
+
+### What was built
+
+`var.py` — `compute_var`, `cross_check_against_numpy`, `compare_rank_conventions`,
+`describe_var`. Runnable standalone with `python3 var.py`.
+
+### The headline number
+
+**99% one-day VaR: $2.4488. Expected shortfall: $2.5805.** On a position worth $6.6391,
+that is **36.89%** and 38.87% respectively.
+
+The interpolation, exactly as printed by the pipeline:
+
+```
+tail probability alpha  : 0.0100
+fractional rank         : (250 - 1) x 0.0100 = 2.4900
+lower order statistic   : index 2 (the 3rd worst) = -2.462080
+                          from 2023-11-14, a +1.940% move
+upper order statistic   : index 3 (the 4th worst) = -2.435070
+                          from 2023-11-02, a +1.912% move
+interpolation weight    : 2.4900 - 2 = 0.4900
+blended quantile        : -2.462080 + 0.4900 x (-2.435070 - -2.462080) = -2.448845
+```
+
+Worst single scenario: a **$2.7719** loss on 2023-01-06 (+2.283%). Expected shortfall is
+the mean of the 3 breaching scenarios.
+
+**Sign convention, stated once and used everywhere: VaR and expected shortfall are
+reported as POSITIVE loss magnitudes.** The underlying quantile keeps its natural sign
+(negative for a loss) and is negated once at the point of reporting. If a position never
+lost money even at its 1st percentile the reported VaR comes out negative; `compute_var`
+flags that rather than clipping it to zero.
+
+### Verification
+
+- **NumPy cross-check agrees to 0.000e+00.** `numpy.percentile(..., method="linear")`
+  gives −2.448845174615 against our −2.448845174615. They match because NumPy's default
+  uses the same `(N-1)*alpha` rank definition we implemented — which is exactly why it is
+  a good check and a bad answer. Calling it would have meant adopting whichever convention
+  NumPy happens to default to rather than implementing the filing's.
+- **Hand-checked** against the four worst P&Ls independently of the module.
+- **Edge cases**: an all-profitable sample returns a negative VaR unclipped; N=101 lands
+  exactly on an observation (weight 0.00); NaN input and single-scenario input are both
+  rejected with explanatory errors.
+
+### The rank convention matters more than the wording admits
+
+"Linear interpolation to the 99% threshold" does not fully specify a calculation — it
+leaves open where in index space the 99% point sits.
+
+| Convention | Rank | VaR | vs ours |
+|---|---|---|---|
+| `(N-1)*alpha` — R type 7, NumPy default, **ours** | 2.4900 | 2.4488 | — |
+| `N*alpha` | 2.5000 | 2.4486 | −0.0003 |
+| `(N+1)*alpha - 1` — R type 6, Weibull | 1.5100 | 2.4844 | +0.0355 |
+
+Spread **$0.0358 on a $2.4488 VaR, 1.46%**. Small at 250 scenarios, but it bounds how
+precisely the filing's wording can be reproduced at all, and it grows as the scenario
+count falls.
+
+### Stress window comparison
+
+| | 2023 baseline | 2020 stress |
+|---|---|---|
+| 99% VaR | 2.4488 | **4.9321** |
+| Expected shortfall | 2.5805 | 5.3881 |
+| Worst scenario | 2.7719 | 5.5885 |
+
+The stress VaR is **2.0×** the baseline — same position, same models, same method, only
+the twelve months behind the reference date differ. Its bracketing scenarios are
+2020-04-06 (+6.792%) and 2020-03-17 (+5.985%).
+
+**Read the stress figure as an upper bound.** Phase 5 measured the direction of the
+frozen-surface bias: a long put is long vega and loses on rallies, so holding today's calm
+surface instead of 2020's elevated one makes the losing tail *deeper* than a true joint
+replay would. On the worst stress scenario, lifting vol 10 points cut the loss from $5.59
+to $1.90. So $4.93 overstates what a full joint simulation of 2020 would give.
+
+### Reading the number
+
+Every scenario in the tail is an **up** day. A long put loses when the market rallies, so
+the dates driving this VaR are the best days of 2023, not the worst — which inverts the
+usual "worst market day" intuition.
+
+Two caveats carry forward, both quantified earlier rather than asserted here:
+
+- **The 2023 window contains no crisis** (Phase 4). Its 1st percentile return is −1.64%
+  against −6.76% for a 2020 window. This VaR is benign as a consequence of the window, not
+  of the position.
+- **BAW's approximation error contributes roughly 1%** to the scenario P&Ls (Phase 2), and
+  therefore to this number.
+
+---
+
 ## Decisions made (previously open)
 
 All resolved by the user after Phase 1:
@@ -815,6 +912,8 @@ Phase 8.
 | 24 | deviation | `main.revalue_across_scenarios` | **No vol-surface shock.** Scenario P&Ls contain spot risk and the smile's response to spot, but no independent volatility risk. Declined by the user; the historical surfaces to build it do exist. |
 | 25 | deviation | `main.taylor_approximation_counterfactual` | Deliberately computes the delta/gamma shortcut the filing forbids, **for demonstration only**, never for a risk number. |
 | 26 | approximation | `main.run_phase_5` | The stress-window run keeps **today's** volatility surface and changes only the return distribution. Since a long put is long vega and loses on rallies, this **overstates** its loss tail relative to a true joint replay of 2020. |
+| 27 | approximation | `var.compute_var` | The `(N-1)*alpha` rank definition is one of several in common use and the filing does not pin one down. Alternatives shift the VaR by up to $0.0358 (1.46%) at this sample size; `compare_rank_conventions` quantifies it. |
+| 28 | approximation | `var.compute_var` | Expected shortfall averages only the **3** scenarios beyond the 99% threshold, so it is correspondingly noisy — a limitation of 250 scenarios, not of the estimator. Simple mean of breaching scenarios, not an integrated tail expectation. |
 
 ---
 

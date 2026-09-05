@@ -19,6 +19,7 @@ import data_loader
 import historical_sim
 import plots
 import sabr
+import var
 
 
 # ======================================================================================
@@ -102,6 +103,9 @@ CONFIG = {
     # window contains no crisis (see Phase 4), so the headline VaR is benign; this shows
     # what the same position and the same method produce when the window does contain one.
     "stress_window_end": "2020-12-31",
+
+    # The filing specifies a 99th percentile confidence level.
+    "confidence_level": 0.99,
 
     # ---- SABR ------------------------------------------------------------------------
     # beta is FIXED, not fitted, because it is close to jointly unidentifiable with rho --
@@ -1810,6 +1814,189 @@ def run_phase_5(config, phase_0_results, phase_3_results, phase_4_results):
     }
 
 
+def run_phase_6(config, phase_5_results):
+    """
+    Phase 6: the filing's 99% VaR, by explicit interpolation between order statistics.
+
+    Inputs:
+        config (dict):          the CONFIG block above.
+        phase_5_results (dict): output of `run_phase_5`, for the scenario P&Ls.
+
+    Returns:
+        dict carrying:
+            'var_result'        (dict) output of `var.compute_var`, baseline window
+            'stress_var_result' (dict) the same for the stress window
+    """
+    revaluation = phase_5_results["revaluation"]
+    stress_revaluation = phase_5_results["stress_revaluation"]
+    position = phase_5_results["position"]
+    confidence_level = config["confidence_level"]
+
+    # ---- The headline number -----------------------------------------------------------
+    print_section("PHASE 6.1  99% VALUE-AT-RISK, BASELINE WINDOW")
+
+    var_result = var.compute_var(
+        revaluation["scenario_pnl"], confidence_level=confidence_level
+    )
+
+    var.describe_var(var_result, revaluation, confidence_level=confidence_level,
+                     label=f"{position['quantity']:+.0f} x SPY "
+                           f"{config['reference_expiry']} ${position['strike']:.0f} "
+                           f"{position['option_type']}, 2023 window")
+
+    # ---- Cross-check --------------------------------------------------------------------
+    print_section("PHASE 6.2  CROSS-CHECK AGAINST NUMPY")
+
+    numpy_quantile = var.cross_check_against_numpy(
+        revaluation["scenario_pnl"], confidence_level
+    )
+    difference = abs(numpy_quantile - var_result["quantile_pnl"])
+
+    print(f"  numpy.percentile(method='linear') : {numpy_quantile:+.12f}")
+    print(f"  our explicit interpolation        : {var_result['quantile_pnl']:+.12f}")
+    print(f"  difference                        : {difference:.3e}")
+    print()
+    print(f"  These agree because NumPy's default interpolation uses the SAME rank")
+    print(f"  definition we implemented, (N-1)*alpha. That is why it makes a good check")
+    print(f"  and a bad answer: matching it confirms our arithmetic, but calling it would")
+    print(f"  have meant adopting whichever convention NumPy happens to default to rather")
+    print(f"  than implementing the one the filing describes.")
+
+    if difference > 1e-9:
+        print(f"  WARNING: the two disagree by more than floating point noise.")
+
+    # ---- How much does the convention matter? -------------------------------------------
+    print_section("PHASE 6.3  SENSITIVITY TO THE RANK CONVENTION")
+
+    conventions = var.compare_rank_conventions(
+        revaluation["scenario_pnl"], confidence_level
+    )
+
+    print(f"  'Linear interpolation to the 99% threshold' still leaves open WHERE in")
+    print(f"  index space the 99% point sits. Several conventions are in common use:")
+    print()
+    print(f"    {'convention':<46} {'rank':>7} {'VaR':>10} {'vs ours':>9}")
+
+    for _, row in conventions.iterrows():
+        print(f"    {row['convention']:<46} {row['fractional_rank']:>7.4f} "
+              f"{row['var']:>10.4f} {row['difference_vs_ours']:>+9.4f}")
+
+    spread = conventions["var"].max() - conventions["var"].min()
+    print()
+    print(f"  Spread across conventions: ${spread:.4f} on a ${var_result['var']:.4f} VaR "
+          f"({spread / var_result['var']:.2%}).")
+    print(f"  Small here, but it bounds how precisely the filing's wording can be")
+    print(f"  reproduced at all, and it grows as the scenario count falls.")
+
+    # ---- The stress window ---------------------------------------------------------------
+    print_section("PHASE 6.4  THE SAME POSITION UNDER THE STRESS WINDOW")
+
+    stress_var_result = var.compute_var(
+        stress_revaluation["scenario_pnl"], confidence_level=confidence_level
+    )
+
+    var.describe_var(stress_var_result, stress_revaluation,
+                     confidence_level=confidence_level,
+                     label=f"same position, {config['stress_window_end'][:4]} window")
+
+    ratio = stress_var_result["var"] / var_result["var"]
+
+    print()
+    print(f"  {'':<28} {'2023 baseline':>15} {'2020 stress':>15}")
+    print(f"  {'99% VaR':<28} {var_result['var']:>15.4f} "
+          f"{stress_var_result['var']:>15.4f}")
+    print(f"  {'expected shortfall':<28} {var_result['expected_shortfall']:>15.4f} "
+          f"{stress_var_result['expected_shortfall']:>15.4f}")
+    print(f"  {'worst scenario':<28} "
+          f"{-revaluation['scenario_pnl'].min():>15.4f} "
+          f"{-stress_revaluation['scenario_pnl'].min():>15.4f}")
+    print()
+    print(f"  The stress VaR is {ratio:.1f}x the baseline. Same position, same pricing")
+    print(f"  models, same 250-day method -- only the twelve months behind the reference")
+    print(f"  date differ.")
+    print()
+    print(f"  Read the stress figure as an UPPER bound, not a lower one. Phase 5 measured")
+    print(f"  the direction of the frozen-surface bias: a long put is long vega and loses")
+    print(f"  on rallies, so holding today's calm surface instead of 2020's elevated one")
+    print(f"  makes the losing tail DEEPER than a true joint replay would. On the worst")
+    print(f"  stress scenario, lifting vol 10 points cut the loss from $5.59 to $1.90.")
+    print(f"  So ${stress_var_result['var']:.2f} overstates what a full joint simulation")
+    print(f"  of 2020 would produce for this particular position.")
+
+    # ---- Context ---------------------------------------------------------------------------
+    print_section("PHASE 6.5  READING THE NUMBER")
+
+    base_price = phase_5_results["base_price"]
+    position_value = position["quantity"] * base_price
+
+    print(f"  Position value today      : ${position_value:.4f}")
+    print(f"  99% one-day VaR           : ${var_result['var']:.4f}   "
+          f"({var_result['var'] / abs(position_value):.2%} of position value)")
+    print(f"  Expected shortfall        : ${var_result['expected_shortfall']:.4f}   "
+          f"({var_result['expected_shortfall'] / abs(position_value):.2%})")
+    print()
+    print(f"  A long put LOSES when the market RALLIES, so every scenario in the tail is")
+    print(f"  an up day. That inverts the usual intuition -- the dates driving this VaR")
+    print(f"  are the best days of 2023, not the worst.")
+    print()
+    print(f"  Two caveats carried forward, both quantified earlier:")
+    print(f"    - the 2023 window contains no crisis (Phase 4): its 1st percentile return")
+    print(f"      is -1.64% against -6.76% for a 2020 window, so this VaR is benign as a")
+    print(f"      consequence of the window rather than of the position;")
+    print(f"    - BAW's approximation error contributes roughly 1% to the scenario P&Ls")
+    print(f"      (Phase 2), and therefore to this number.")
+
+    # ---- Save ----------------------------------------------------------------------------
+    print_section("PHASE 6.6  TABLES")
+
+    summary_path = os.path.join(config["tables_dir"], "var_summary.csv")
+    pd.DataFrame([
+        {
+            "window": "2023 baseline",
+            "confidence_level": confidence_level,
+            "n_scenarios": var_result["n_scenarios"],
+            "var": var_result["var"],
+            "expected_shortfall": var_result["expected_shortfall"],
+            "quantile_pnl": var_result["quantile_pnl"],
+            "fractional_rank": var_result["fractional_rank"],
+            "lower_index": var_result["lower_index"],
+            "upper_index": var_result["upper_index"],
+            "weight": var_result["weight"],
+            "lower_pnl": var_result["lower_pnl"],
+            "upper_pnl": var_result["upper_pnl"],
+            "worst_scenario_pnl": revaluation["scenario_pnl"].min(),
+            "position_value": position_value,
+        },
+        {
+            "window": f"{config['stress_window_end'][:4]} stress",
+            "confidence_level": confidence_level,
+            "n_scenarios": stress_var_result["n_scenarios"],
+            "var": stress_var_result["var"],
+            "expected_shortfall": stress_var_result["expected_shortfall"],
+            "quantile_pnl": stress_var_result["quantile_pnl"],
+            "fractional_rank": stress_var_result["fractional_rank"],
+            "lower_index": stress_var_result["lower_index"],
+            "upper_index": stress_var_result["upper_index"],
+            "weight": stress_var_result["weight"],
+            "lower_pnl": stress_var_result["lower_pnl"],
+            "upper_pnl": stress_var_result["upper_pnl"],
+            "worst_scenario_pnl": stress_revaluation["scenario_pnl"].min(),
+            "position_value": position_value,
+        },
+    ]).to_csv(summary_path, index=False)
+
+    conventions_path = os.path.join(config["tables_dir"], "var_rank_conventions.csv")
+    conventions.to_csv(conventions_path, index=False)
+
+    print(f"  Saved table:  {summary_path}")
+    print(f"  Saved table:  {conventions_path}")
+
+    return {
+        "var_result": var_result,
+        "stress_var_result": stress_var_result,
+    }
+
+
 def main():
     """
     Run the full pipeline end to end.
@@ -1825,9 +2012,11 @@ def main():
     phase_1_results = run_phase_1(CONFIG, phase_0_results)
     phase_3_results = run_phase_3(CONFIG, phase_0_results, phase_1_results)
     phase_4_results = run_phase_4(CONFIG, phase_0_results)
-    run_phase_5(CONFIG, phase_0_results, phase_3_results, phase_4_results)
+    phase_5_results = run_phase_5(CONFIG, phase_0_results, phase_3_results,
+                                  phase_4_results)
+    run_phase_6(CONFIG, phase_5_results)
 
-    print_section("PHASE 5 COMPLETE")
+    print_section("PHASE 6 COMPLETE")
 
 
 if __name__ == "__main__":
