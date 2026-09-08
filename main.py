@@ -3,13 +3,18 @@ Top-level pipeline for the SPY options VaR replication (SR-FICC-2013-02 methodol
 
 Run this file to reproduce every result in the project:
 
-    python main.py
+    python3 main.py                       the original 2023-12-29 case
+    python3 main.py config_2026_06_01     the 2026-06-01 Databento case
 
-All configuration lives in the CONFIG block immediately below. There are no magic numbers
-scattered through the other modules -- anything you might want to change is here.
+All configuration lives in configs/, one file per reference case. There are no magic
+numbers scattered through the other modules -- anything you might want to change is in
+the config file for the case you are running. This file is the runner: it loads a config
+and hands it to the phase functions, which take config as a parameter.
 """
 
+import importlib.util
 import os
+import sys
 
 import numpy as np
 import pandas as pd
@@ -20,108 +25,62 @@ import historical_sim
 import plots
 import sabr
 import var
-
-
 # ======================================================================================
 # CONFIGURATION
 # ======================================================================================
 #
-# Every assumption in the project is stated here, with its source. Nothing below this
-# block invents a constant of its own.
+# Every assumption in the project is stated in a config file under configs/, one per
+# reference case, with its source. Nothing in this file or any other module invents a
+# constant of its own.
+#
+# main.py is a thin runner: it loads whichever config it is given and hands it to the
+# same phase functions, which take config as a parameter and are unchanged by this.
+#
+#     python3 main.py                       -> configs/config_2023_12_29.py (the default)
+#     python3 main.py config_2026_06_01     -> configs/config_2026_06_01.py
+#
+# Adding a new reference case means adding a file to configs/. It never means editing
+# this one.
 
-CONFIG = {
-    # ---- Paths -----------------------------------------------------------------------
-    "data_dir": "data",
-    "figures_dir": os.path.join("outputs", "figures"),
-    "tables_dir": os.path.join("outputs", "tables"),
+CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
+DEFAULT_CONFIG = "config_2023_12_29"
 
-    # ---- Reference date and expiry ---------------------------------------------------
-    # 2023-12-29 is the last quote date in the OptionsDX files we hold. Working from the
-    # end of the dataset means the 250-day historical lookback lands almost exactly on
-    # calendar year 2023, which makes the VaR window easy to describe and to check.
-    "reference_date": "2023-12-29",
 
-    # 2024-02-16 is a standard third-Friday monthly expiry, 49 calendar days out. It was
-    # chosen for liquidity: 156 quoted strikes from $210 to $575, tight two-sided markets
-    # through the at-the-money region, and no SPY ex-dividend date inside the window.
-    "reference_expiry": "2024-02-16",
+def available_configs():
+    """Every config file that could be run, by the name you would pass on the command line."""
+    if not os.path.isdir(CONFIG_DIR):
+        return []
+    return sorted(f[:-3] for f in os.listdir(CONFIG_DIR)
+                  if f.endswith(".py") and not f.startswith("__"))
 
-    # ---- Historical simulation window ------------------------------------------------
-    # The filing specifies a one-year lookback for the historical simulation. 250 trading
-    # days is the conventional count for one year. We load extra history so that the
-    # return series has a full lookback available with room to spare.
-    "lookback_days": 250,
-    "price_history_start": "2022-01-03",
 
-    # Used only for the Phase 4 diagnostic showing how much the risk estimate depends on
-    # which twelve months happen to precede the reference date. Not part of the VaR.
-    "window_comparison_start": "2010-01-04",
-    "window_comparison_dates": [
-        "2011-12-30",  # post-crisis, European sovereign debt stress
-        "2015-12-31",  # calm, before the August 2015 flash crash aged out
-        "2018-12-31",  # the February volatility spike and the Q4 selloff
-        "2020-12-31",  # the COVID crash sits squarely inside this window
-        "2022-12-30",  # the 2022 bear market
-        "2023-12-29",  # ours
-    ],
+def load_config(name):
+    """
+    Load the CONFIG dictionary out of configs/<name>.py.
 
-    # ---- Rates and carry -------------------------------------------------------------
-    # 3-month Treasury constant maturity yield on 2023-12-29 (FRED series DGS3MO).
-    # We pin the rate externally because a Treasury yield is directly observable and
-    # uncontroversial, whereas the dividend yield is not -- see below.
-    "risk_free_rate": 0.0540,
+    Loaded by file path rather than by import so that configs/ needs no __init__.py and
+    stays what it is -- a folder of data files that happen to be written in Python, for
+    the comments. Every assumption in this project carries its reasoning next to it, and
+    JSON cannot hold a comment.
 
-    # The dividend yield and the cost of carry are NOT set here. They are IMPLIED from
-    # put-call parity on the option quotes themselves at run time, so that the forward we
-    # hand to SABR is the forward the option market is actually trading. Assuming SPY's
-    # ~1.4% trailing dividend yield would be wrong for this particular expiry: SPY's
-    # December 2023 ex-dividend date was the 15th and the next is 2024-03-15, so NO
-    # dividend falls between our reference date and our expiry. The implied yield should
-    # therefore come out near zero, and it does. See `imply_forward_from_parity`.
+    Inputs:
+        name (str): config module name without the .py, e.g. "config_2026_06_01".
 
-    # ---- Quote quality filters -------------------------------------------------------
-    # Used when implying the forward: only strikes within this band of spot, with both
-    # legs quoted no wider than this, are trusted.
-    "parity_moneyness_band": 0.05,
-    "parity_max_spread": 0.30,
-
-    # ---- The position we are measuring risk on ---------------------------------------
-    # ONE option, as the filing's methodology is demonstrated on a single position first.
-    # A put rather than a call, deliberately: with b = 5.5926% > r = 5.4000% (no SPY
-    # dividend falls inside this window) early exercise on a CALL is never optimal, so BAW
-    # would collapse to the European price and the American machinery would do nothing
-    # visible. The put carries a genuine early-exercise premium of about $0.29 on a $6.47
-    # price. The 475 strike is the closest listed strike to spot, and its quotes are among
-    # the tightest on the board.
-    "position": {
-        "strike": 475.0,
-        "option_type": "put",
-        "quantity": 1.0,          # signed: positive is long, negative is short
-    },
-
-    # A second, harsher lookback window run alongside the baseline for context. The 2023
-    # window contains no crisis (see Phase 4), so the headline VaR is benign; this shows
-    # what the same position and the same method produce when the window does contain one.
-    "stress_window_end": "2020-12-31",
-
-    # The filing specifies a 99th percentile confidence level.
-    "confidence_level": 0.99,
-
-    # ---- SABR ------------------------------------------------------------------------
-    # beta is FIXED, not fitted, because it is close to jointly unidentifiable with rho --
-    # both control skew and trade off against each other. 1.0 is the equity index
-    # convention: it makes the forward process lognormal and leaves rho as the sole,
-    # interpretable driver of skew. See the long note in `sabr.calibrate_sabr`.
-    "sabr_beta": 1.0,
-
-    # Only strikes within this fraction of the forward are calibrated to. The full smile
-    # runs from -53% to +20% moneyness, and both extremes are bad fit targets: Hagan's
-    # formula is an ASYMPTOTIC expansion that degrades far from the money, and 35 of the
-    # 151 quoted strikes have a mid below $0.10 with a median relative spread of 40% --
-    # quote noise that would carry equal weight in an unweighted least-squares fit and
-    # drag the at-the-money region off. See the Phase 1 sensitivity table.
-    "calibration_moneyness_band": 0.15,
-}
+    Returns:
+        dict: the CONFIG dictionary defined in that file.
+    """
+    path = os.path.join(CONFIG_DIR, f"{name}.py")
+    if not os.path.exists(path):
+        raise SystemExit(
+            f"No such config: {path}\n"
+            f"Available: {', '.join(available_configs()) or '(none)'}"
+        )
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not hasattr(module, "CONFIG"):
+        raise SystemExit(f"{path} defines no CONFIG dictionary.")
+    return module.CONFIG
 
 
 def print_section(title):
@@ -148,7 +107,7 @@ def run_phase_0(config):
     no modelling at all -- it loads, checks, summarises, and draws one diagnostic plot.
 
     Inputs:
-        config (dict): the CONFIG block above.
+        config (dict): the CONFIG dictionary loaded from configs/.
 
     Returns:
         dict carrying the loaded objects the later phases will need:
@@ -293,7 +252,7 @@ def run_phase_1(config, phase_0_results):
     Phase 1: calibrate the SABR model to the observed volatility smile.
 
     Inputs:
-        config (dict):           the CONFIG block above.
+        config (dict):           the CONFIG dictionary loaded from configs/.
         phase_0_results (dict):  output of `run_phase_0`.
 
     Returns:
@@ -931,7 +890,7 @@ def run_phase_3(config, phase_0_results, phase_1_results):
       3. We price real strikes through SABR into BAW and compare against the market.
 
     Inputs:
-        config (dict):          the CONFIG block above.
+        config (dict):          the CONFIG dictionary loaded from configs/.
         phase_0_results (dict): output of `run_phase_0`.
         phase_1_results (dict): output of `run_phase_1`, used only for the before/after
             comparison of fit quality.
@@ -1260,7 +1219,7 @@ def run_phase_4(config, phase_0_results):
     of alternative prices for tomorrow. Phase 5 is what reprices the option under each one.
 
     Inputs:
-        config (dict):          the CONFIG block above.
+        config (dict):          the CONFIG dictionary loaded from configs/.
         phase_0_results (dict): output of `run_phase_0`, for the price history and spot.
 
     Returns:
@@ -1457,7 +1416,7 @@ def run_phase_5(config, phase_0_results, phase_3_results, phase_4_results):
     Phase 5: full revaluation of the position across every historical scenario.
 
     Inputs:
-        config (dict):          the CONFIG block above.
+        config (dict):          the CONFIG dictionary loaded from configs/.
         phase_0_results (dict): for spot, T, carry.
         phase_3_results (dict): for the calibrated SABR parameters.
         phase_4_results (dict): for the scenarios.
@@ -1819,7 +1778,7 @@ def run_phase_6(config, phase_5_results):
     Phase 6: the filing's 99% VaR, by explicit interpolation between order statistics.
 
     Inputs:
-        config (dict):          the CONFIG block above.
+        config (dict):          the CONFIG dictionary loaded from configs/.
         phase_5_results (dict): output of `run_phase_5`, for the scenario P&Ls.
 
     Returns:
@@ -2007,7 +1966,7 @@ def build_summary_rows(config, phase_0_results, phase_3_results, phase_4_results
     result, and the two caveats that most affect how the number should be read.
 
     Inputs:
-        config (dict):          the CONFIG block above.
+        config (dict):          the CONFIG dictionary loaded from configs/.
         phase_0_results (dict), phase_3_results (dict), phase_4_results (dict),
         phase_5_results (dict), phase_6_results (dict): the phase outputs.
 
@@ -2180,29 +2139,41 @@ def run_phase_8(config, phase_0_results, phase_3_results, phase_4_results,
         print()
 
 
-def main():
+def main(config_name=None):
     """
-    Run the full pipeline end to end.
+    Run the full pipeline end to end against one config.
+
+    Inputs:
+        config_name (str or None): which file under configs/ to run, without the .py.
+            Defaults to DEFAULT_CONFIG, which is the original 2023-12-29 case, so that
+            `python3 main.py` reproduces the run recorded in PROJECT_LOG.md exactly as
+            it did before configuration moved out of this file.
 
     Returns:
-        None. Prints progress and writes figures and tables under outputs/.
+        None. Prints progress and writes figures and tables under the directories the
+        chosen config names -- each reference case writes to its own, so runs never
+        overwrite one another.
     """
-    print_section("SPY OPTIONS VaR  --  SR-FICC-2013-02 METHODOLOGY REPLICATION")
-    print(f"  Reference date : {CONFIG['reference_date']}")
-    print(f"  Reference expiry: {CONFIG['reference_expiry']}")
+    config = load_config(config_name or DEFAULT_CONFIG)
 
-    phase_0_results = run_phase_0(CONFIG)
-    phase_1_results = run_phase_1(CONFIG, phase_0_results)
-    phase_3_results = run_phase_3(CONFIG, phase_0_results, phase_1_results)
-    phase_4_results = run_phase_4(CONFIG, phase_0_results)
-    phase_5_results = run_phase_5(CONFIG, phase_0_results, phase_3_results,
+    print_section("SPY OPTIONS VaR  --  SR-FICC-2013-02 METHODOLOGY REPLICATION")
+    print(f"  Config          : {config_name or DEFAULT_CONFIG}")
+    print(f"  Reference date  : {config['reference_date']}")
+    print(f"  Reference expiry: {config['reference_expiry']}")
+    print(f"  Data directory  : {config['data_dir']}")
+
+    phase_0_results = run_phase_0(config)
+    phase_1_results = run_phase_1(config, phase_0_results)
+    phase_3_results = run_phase_3(config, phase_0_results, phase_1_results)
+    phase_4_results = run_phase_4(config, phase_0_results)
+    phase_5_results = run_phase_5(config, phase_0_results, phase_3_results,
                                   phase_4_results)
-    phase_6_results = run_phase_6(CONFIG, phase_5_results)
-    run_phase_8(CONFIG, phase_0_results, phase_3_results, phase_4_results,
+    phase_6_results = run_phase_6(config, phase_5_results)
+    run_phase_8(config, phase_0_results, phase_3_results, phase_4_results,
                 phase_5_results, phase_6_results)
 
     print_section("PIPELINE COMPLETE")
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1] if len(sys.argv) > 1 else None)
