@@ -62,9 +62,14 @@ CONFIG = {
     # -3.58% to -1.75%, purely because the crisis fell off the back of the window. That is
     # the same effect the original demonstrated by comparing 2020 against 2023, observed
     # here within a single continuous dataset.
+    # Note the off-by-one that matters here: a 250-RETURN window needs 251 sessions,
+    # not 250, because the first session yields no return. Session 250 is 2025-12-31 and
+    # session 251 is 2026-01-02, so 2026-01-02 is the earliest date that can anchor a
+    # full window. generate_scenarios raises on this; rolling_window_statistics does not
+    # -- it drops the date silently, which is how the error was first missed.
     "window_comparison_start": "2025-01-02",
     "window_comparison_dates": [
-        "2025-12-31",  # earliest date with a full window; April 2025 fully inside
+        "2026-01-02",  # earliest date with a full window; April 2025 fully inside
         "2026-01-30",  # April 2025 still inside
         "2026-03-16",  # April 2025 still inside, near the back edge
         "2026-04-28",  # April 2025 has just aged out
@@ -108,10 +113,10 @@ CONFIG = {
     },
 
     # DIFFERS. The original's stress window was 2020, which this dataset cannot reach. The
-    # harshest window available is the earliest one -- 2025-01-02 to 2025-12-31 -- which
+    # harshest window available is the earliest one -- 2025-01-05 to 2026-01-02 -- which
     # contains the April 2025 selloff in full: 1st percentile -3.58% against the baseline
     # window's -1.75%, worst day -5.85% against -2.70%.
-    "stress_window_end": "2025-12-31",
+    "stress_window_end": "2026-01-02",
 
     # Identical: the filing specifies a 99th percentile confidence level.
     "confidence_level": 0.99,

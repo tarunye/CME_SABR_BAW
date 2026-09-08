@@ -184,10 +184,20 @@ def run_phase_0(config):
     print(f"  Cost of carry b, F = S*exp(b*T)         : "
           f"{forward_result['cost_of_carry']:.4%}")
     print()
-    print("  Reading: the implied dividend yield is near zero because no SPY ex-dividend")
-    print("  date falls between 2023-12-29 and 2024-02-16 (Dec ex-div was the 15th, the")
-    print("  next is 2024-03-15). Assuming SPY's ~1.4% trailing yield here would have")
-    print("  mispriced the forward by roughly $0.90 and tilted the whole smile.")
+    # Stated in dollars as well as annualised, because a yield annualised over a few
+    # weeks is easy to misread: the same dividend looks enormous over a short window and
+    # negligible over a long one. The dollar figure says plainly whether an ex-dividend
+    # date falls between the reference date and the expiry.
+    implied_q = forward_result["implied_dividend_yield"]
+    dividend_dollars = implied_q * time_to_expiry_years * spot
+    print(f"  Reading: this yield is DERIVED from the quotes, not assumed. Annualised at")
+    print(f"  {implied_q:+.4%} over {round(time_to_expiry_years * 365)} days it amounts to "
+          f"${dividend_dollars:+.2f} of dividend on a")
+    print(f"  ${spot:.2f} underlying -- which is the market telling us whether an SPY")
+    print(f"  ex-dividend date falls between {config['reference_date']} and "
+          f"{config['reference_expiry']}.")
+    print(f"  Assuming a trailing yield instead would mis-set the forward and tilt the")
+    print(f"  whole smile.")
 
     # ---- Build the smile -------------------------------------------------------------
     print_section("PHASE 0.4  DATA SUMMARY")
@@ -958,10 +968,13 @@ def run_phase_3(config, phase_0_results, phase_1_results):
     vendor_roughness = data_loader.smile_local_roughness(vendor_view)
     reimplied_roughness = data_loader.smile_local_roughness(reimplied_fit_smile)
 
-    print(f"  The two strikes nearest the forward (477, 478) both have CROSSED put quotes")
-    print(f"  and were filtered out, leaving a ${reimplied_step['strike_gap']:.0f} hole at "
-          f"the crossover. So we judge by the")
-    print(f"  SIGN of the adjacent gap, not by a value extrapolated across that hole.")
+    print(f"  The crossover sits between the last put strike "
+          f"({reimplied_step['last_put_strike']:.0f}) and the first")
+    print(f"  call strike ({reimplied_step['first_call_strike']:.0f}), a "
+          f"${reimplied_step['strike_gap']:.0f} gap. Any strike in between failed the "
+          f"quality")
+    print(f"  filters -- a crossed or one-sided quote. So we judge by the SIGN of the")
+    print(f"  adjacent gap, not by a value extrapolated across that hole.")
     print(f"  The smile slopes down here, so a consistent smile needs a NEGATIVE gap.")
     print()
     print(f"  {'':<28} {'vendor IV':>12} {'our IV':>12}")
@@ -1364,14 +1377,17 @@ def run_phase_4(config, phase_0_results):
         print(f"  consequence of WHICH twelve months happen to sit behind the reference")
         print(f"  date, and it is the central weakness of unweighted historical simulation:")
         print(f"  a crisis counts fully until the day it ages out of the window, then not")
-        print(f"  at all. Our 2023 window contains no crisis, so the Phase 6 VaR will be")
-        print(f"  correspondingly benign. That is the method working as specified, not a")
-        print(f"  bug -- but it is the number's biggest caveat.")
+        print(f"  at all. Our window ends {config['reference_date']} with a 1st percentile")
+        print(f"  of {our_percentile:+.2%}, so the Phase 6 VaR inherits that window's "
+              f"severity")
+        print(f"  and nothing else. That is the method working as specified, not a bug --")
+        print(f"  but it is the number's biggest caveat.")
 
-    # NOTE (approximation): the comparison years are shown for context only and are not
-    # subjected to the Phase 0 calendar validation. Data quality varies across the vendor's
-    # history -- 2022 alone carries 4 missing trading days and 9 phantom rows stamped on
-    # market holidays. Our own 2023 window is clean, which is what matters for the result.
+    # NOTE (approximation): the comparison windows are shown for context only and are not
+    # subjected to the Phase 0 calendar validation. Data quality varies across a vendor's
+    # history -- in the OptionsDX files, 2022 alone carries 4 missing trading days and 9
+    # phantom rows stamped on market holidays. The window actually used IS validated in
+    # Phase 0, which is what matters for the result.
 
     # ---- Tables and figures ------------------------------------------------------------
     print_section("PHASE 4.6  TABLES AND FIGURES")
@@ -1679,7 +1695,7 @@ def run_phase_5(config, phase_0_results, phase_3_results, phase_4_results):
 
     # Returns drawn from the stress window, but applied to TODAY's spot and priced off
     # TODAY's volatility surface. The question being asked is "what if tomorrow's move
-    # were drawn from 2020's distribution instead of 2023's".
+    # were drawn from the stress window's distribution instead of our own".
     stress_returns = long_returns.loc[
         long_returns["date"] <= pd.to_datetime(config["stress_window_end"])
     ]
@@ -1703,7 +1719,9 @@ def run_phase_5(config, phase_0_results, phase_3_results, phase_4_results):
           f"{stress_scenarios['historical_date'].iloc[0]:%Y-%m-%d} to "
           f"{stress_scenarios['historical_date'].iloc[-1]:%Y-%m-%d}")
     print()
-    print(f"  {'':<24} {'2023 baseline':>15} {'2020 stress':>15}")
+    baseline_label = f"{config['reference_date'][:4]} baseline"
+    stress_label = f"{config['stress_window_end'][:4]} stress"
+    print(f"  {'':<24} {baseline_label:>15} {stress_label:>15}")
     print(f"  {'worst daily move':<24} "
           f"{revaluation['historical_return'].min():>14.2%} "
           f"{stress_revaluation['historical_return'].min():>14.2%}")
@@ -1801,7 +1819,8 @@ def run_phase_6(config, phase_5_results):
     var.describe_var(var_result, revaluation, confidence_level=confidence_level,
                      label=f"{position['quantity']:+.0f} x SPY "
                            f"{config['reference_expiry']} ${position['strike']:.0f} "
-                           f"{position['option_type']}, 2023 window")
+                           f"{position['option_type']}, "
+                           f"{config['reference_date'][:4]} window")
 
     # ---- Cross-check --------------------------------------------------------------------
     print_section("PHASE 6.2  CROSS-CHECK AGAINST NUMPY")
@@ -1861,7 +1880,9 @@ def run_phase_6(config, phase_5_results):
     ratio = stress_var_result["var"] / var_result["var"]
 
     print()
-    print(f"  {'':<28} {'2023 baseline':>15} {'2020 stress':>15}")
+    baseline_label = f"{config['reference_date'][:4]} baseline"
+    stress_label = f"{config['stress_window_end'][:4]} stress"
+    print(f"  {'':<28} {baseline_label:>15} {stress_label:>15}")
     print(f"  {'99% VaR':<28} {var_result['var']:>15.4f} "
           f"{stress_var_result['var']:>15.4f}")
     print(f"  {'expected shortfall':<28} {var_result['expected_shortfall']:>15.4f} "
@@ -1896,12 +1917,14 @@ def run_phase_6(config, phase_5_results):
     print()
     print(f"  A long put LOSES when the market RALLIES, so every scenario in the tail is")
     print(f"  an up day. That inverts the usual intuition -- the dates driving this VaR")
-    print(f"  are the best days of 2023, not the worst.")
+    print(f"  are the best days in the window, not the worst.")
     print()
     print(f"  Two caveats carried forward, both quantified earlier:")
-    print(f"    - the 2023 window contains no crisis (Phase 4): its 1st percentile return")
-    print(f"      is -1.64% against -6.76% for a 2020 window, so this VaR is benign as a")
-    print(f"      consequence of the window rather than of the position;")
+    print(f"    - this number inherits the severity of whichever twelve months precede")
+    print(f"      {config['reference_date']} (Phase 4). A window containing a crisis "
+          f"produces a")
+    print(f"      materially larger VaR for the same position, so read this figure")
+    print(f"      alongside that comparison;")
     print(f"    - BAW's approximation error contributes roughly 1% to the scenario P&Ls")
     print(f"      (Phase 2), and therefore to this number.")
 
@@ -1911,7 +1934,9 @@ def run_phase_6(config, phase_5_results):
     summary_path = os.path.join(config["tables_dir"], "var_summary.csv")
     pd.DataFrame([
         {
-            "window": "2023 baseline",
+            # Derived, not hardcoded: this label is written into var_summary.csv and is
+            # what a comparison across reference cases reads to tell the runs apart.
+            "window": f"{config['reference_date'][:4]} baseline",
             "confidence_level": confidence_level,
             "n_scenarios": var_result["n_scenarios"],
             "var": var_result["var"],
