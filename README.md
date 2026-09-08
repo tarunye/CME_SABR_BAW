@@ -4,14 +4,24 @@ A research codebase that reproduces the options margining methodology described 
 2013 FICC/NYPC rule filing with the SEC (File No. **SR-FICC-2013-02**), applied to SPY
 options instead of the filing's interest rate futures options.
 
-**Headline result** — for a long 1 × SPY 2024-02-16 $475 put worth $6.6391 on 2023-12-29:
+**Headline result** — the same methodology run on two independent reference cases, from
+two independent data sources:
 
-| | |
-|---|---|
-| **99% one-day VaR** | **$2.4488** (36.89% of position value) |
-| Expected shortfall | $2.5805 (mean of 3 breaching scenarios) |
-| Worst scenario in sample | $2.7719 loss, from 2023-01-06 (+2.283%) |
-| Same position, 2020 lookback window | $4.9321 (2.0× baseline) |
+| | 2023-12-29 (OptionsDX) | 2026-06-01 (Databento) |
+|---|---|---|
+| Position | +1 × 2024-02-16 $475 put | +1 × 2026-07-17 $759 put |
+| Position value | $6.6391 | $14.4221 |
+| **99% one-day VaR** | **$2.4488** (36.89%) | **$4.1216** (28.58%) |
+| Expected shortfall | $2.5805 (3 breaches) | $5.3674 (3 breaches) |
+| Worst scenario in sample | $2.7719, from 2023-01-06 | $6.0986, from 2026-03-31 |
+| Stress-window VaR | $4.9321 (2020, 2.0×) | $5.2226 (2026-01-02, 1.3×) |
+
+The dollar figures are not directly comparable — different strikes on a different
+underlying level. **VaR as a percentage of position value is the like-for-like number.**
+The two cases differ because the market differed: rates fell 5.40% → 3.66%, the carry
+regime flipped from `b > r` to `b < r` (a dividend falls inside the second window and not
+the first), and the lookback window's excess kurtosis went from −0.18 to +1.57. The data
+source contributes almost nothing to that gap — see *Two reference cases* below.
 
 ## The methodology in one paragraph
 
@@ -37,10 +47,13 @@ VaR                    ->  99th percentile of the loss distribution, interpolate
 
 ## Getting the data
 
-**The raw data is not in this repository.** It is roughly 600 MB across fourteen files,
-which is too large for GitHub, and it is redistributed under terms we do not hold.
+**The raw data is not in this repository.** There are two datasets, one per reference
+case; neither is ours to redistribute.
 
-The project uses **SPY end-of-day option chains covering 2010–2023**, originally published
+### The original dataset (2010–2023, OptionsDX)
+
+Roughly 600 MB across fourteen files, too large for GitHub. **SPY end-of-day option chains
+covering 2010–2023**, originally published
 by [OptionsDX](https://www.optionsdx.com/) as free sample data and widely mirrored on
 Kaggle — search Kaggle for *"SPY options EOD"* or *"SPY option chain 2010 2023"*. Any
 mirror of the OptionsDX SPY EOD set will work.
@@ -76,15 +89,78 @@ Only the files for the years you actually use are needed. The default configurat
 2022 and 2023 for the main pipeline, plus 2010–2023 for one diagnostic that compares
 lookback windows across market regimes.
 
+### The second dataset (2025–2026, Databento)
+
+The 2026-06-01 case uses **SPY option quotes from Databento's OPRA feed**, pulled and
+reshaped by the scripts in `databento_pullers/`. That data is not in this repository
+either — 363 MB raw, and likewise not ours to redistribute — but unlike the OptionsDX set
+it is fully reproducible from this repo with a Databento API key:
+
+```bash
+export DATABENTO_API_KEY=...
+python3 databento_pullers/databento_pull_2025_2026.py all   # ~$8, 353 sessions
+python3 databento_pullers/databento_reshape.py              # -> data/databento_2025_2026/
+```
+
+The pull takes a three-minute pre-close window of `cbbo-1m` quotes per session, joins them
+to per-day instrument definitions, and collapses each contract to one end-of-day row.
+`UNDERLYING_LAST` is SPY's observed consolidated close (`EQUS.SUMMARY` daily bars).
+The reshaped output uses the same bracketed column layout as the OptionsDX files, so
+`data_loader.py` reads it unchanged — only `data_dir` moves.
+
+Two calendar facts the pull surfaced, both now handled explicitly in
+`databento_pull_2025_2026.py`, and both invisible to a naive calendar:
+
+- **Early closes.** The NYSE shuts at 1pm ET on about three days a year. Those are still
+  trading days, so a 4pm window looks ordinary while sitting three hours after the bell.
+- **One-off closures.** 2025-01-09 was a national day of mourning. The derived calendar
+  lists it as a trading day; no SPY option was active at all.
+
+## Two reference cases
+
+The project has been run end to end twice, on two independently sourced datasets. The
+methodology is identical — `sabr.py`, `baw.py`, `historical_sim.py` and `var.py` are byte
+for byte the same in both runs. Only the config and the dataset differ.
+
+The comparison matters because the two runs disagree substantially, and the question is
+whether that disagreement is the market or the plumbing. It is the market:
+
+| | 2023-12-29 | 2026-06-01 |
+|---|---|---|
+| Implied dividend yield | −0.19% (no ex-div in window) | +1.90% (**$1.82** on $758.54) |
+| Carry regime | `b > r` | `b < r` |
+| Risk-free rate | 5.40% | 3.66% |
+| SABR `rho` (skew) | −0.524 | −0.634 |
+| Excess kurtosis of window | −0.18 (thin tails) | +1.57 (fat tails) |
+| Fit RMSE | 0.2346 vol pts | 0.2080 vol pts |
+
+The data source's own contribution was measured directly, by pulling Databento data for
+**2023-12-29 itself** and running the project's unchanged code against it: median mid
+price difference **$0.0000** across 151 common strikes, median implied-vol difference
+**0.0000 vol points**, parity forward apart by **0.89 bp**. Against differences of 8.3
+percentage points in VaR-to-position, that cannot be what separates the two answers.
+
+That cross-check also settled an open question from Phase 3. The OptionsDX vendor's
+implied vols stepped the *wrong way* across the put/call crossover — an impossible shape
+that no smooth smile can fit, and the reason the project re-implies its own volatilities.
+Databento does not reproduce it, and neither does the second case. The kink was the
+vendor's. The residual inconsistency underneath it, roughly +0.15 vol points, is real and
+appears in both sources.
+
+`PROJECT_LOG.md` carries the full side-by-side under *Stage D*, including what the second
+case does **not** establish.
+
 ## Running it
 
 ```bash
 pip install -r requirements.txt
-python3 main.py
+python3 main.py                      # the 2023-12-29 case (OptionsDX)
+python3 main.py config_2026_06_01    # the 2026-06-01 case (Databento)
 ```
 
 That runs the whole pipeline and writes every figure and table, in about nine seconds from
-a cold start. The first run parses the parquet files and caches derived pulls to
+a cold start. Each case writes to its own output directory, so runs never overwrite one
+another. The first run parses the parquet files and caches derived pulls to
 `data/*.csv`; later runs read the caches. Delete those CSVs to force a rebuild.
 
 Every module with a self-contained result also runs on its own:
@@ -96,8 +172,10 @@ python3 historical_sim.py  # scenario generation and return statistics
 python3 var.py             # the VaR, from the saved scenario revaluation
 ```
 
-All configuration lives in the `CONFIG` block at the top of `main.py`. There are no magic
-numbers elsewhere.
+All configuration lives in `configs/`, one file per reference case, with every assumption
+stated next to its source. There are no magic numbers elsewhere, and `main.py` is a thin
+runner that loads whichever config it is given — adding a third reference case means
+adding a file to `configs/`, never editing `main.py`.
 
 ## What each file does
 
@@ -109,7 +187,9 @@ numbers elsewhere.
 | `historical_sim.py` | Daily returns, scenario generation, and the return-sample diagnostics |
 | `var.py` | 99% VaR by explicit interpolation between order statistics, expected shortfall, and the rank-convention comparison |
 | `plots.py` | One function per figure, all saving to `outputs/figures/` |
-| `main.py` | The `CONFIG` block holding every assumption, and the phase-by-phase pipeline |
+| `main.py` | The phase-by-phase pipeline, and the runner that loads a config |
+| `configs/` | One config per reference case: `config_2023_12_29.py`, `config_2026_06_01.py` |
+| `databento_pullers/` | Cost checks, the Databento pull, the reshape into this project's dataset format, and the validation and sanity-check scripts |
 | `PROJECT_LOG.md` | Running record of what each phase built, every decision and why, the bugs found, and the consolidated assumptions table |
 
 ## What each figure shows
@@ -217,16 +297,23 @@ with the evidence behind each. Grep the source for `# NOTE` to find them in plac
 
 ## Limitations
 
-Beyond the itemised deviations above, five things about this result deserve emphasis.
+Beyond the itemised deviations above, six things about these results deserve emphasis.
 
-**The lookback window contains no crisis, and that dominates the answer.** Calendar 2023
-was calm: realised volatility 13.14%, excess kurtosis −0.18 (tails *thinner* than a
-normal), and not one day beyond 3σ. The 1st percentile return is −1.64% against −6.76% for
-a window ending in 2020 — **4.1× smaller**. The VaR is benign as a consequence of the
-window, not of the position. This is the central weakness of unweighted historical
-simulation: a crisis counts fully until the day it ages out of the window, then not at all.
-The `spy_price_history.png` figure shows the entire 2022 bear market sitting outside the
-shaded region, contributing nothing.
+**The lookback window's severity dominates the answer, in both cases.** Calendar 2023 was
+calm: realised volatility 13.14%, excess kurtosis −0.18 (tails *thinner* than a normal),
+and not one day beyond 3σ. Its 1st percentile return is −1.64% against −6.76% for a window
+ending in 2020 — **4.1× smaller**. The VaR is benign as a consequence of the window, not of
+the position. This is the central weakness of unweighted historical simulation: a crisis
+counts fully until the day it ages out of the window, then not at all. The
+`spy_price_history.png` figure shows the entire 2022 bear market sitting outside the shaded
+region, contributing nothing.
+
+The second case demonstrates the same effect *inside one continuous dataset*, which is
+more direct evidence than the original could offer. The April 2025 tariff selloff (−5.85%,
+then +10.50% five sessions later) sits at sessions 63–68 of the Databento pull. It is
+inside the lookback window for reference dates up to roughly 2026-03, and has aged out by
+2026-06-01 — the 1st percentile return halving from −3.56% to −1.75% as it falls off the
+back of the window. Nothing about the market changed at that moment; only the window did.
 
 **There is no volatility risk in this number.** The surface is frozen at today's
 calibration and only the anchor point moves with spot. A genuine full revaluation of a
@@ -242,9 +329,17 @@ calibration and a diversification analysis) was scoped and deliberately skipped.
 margin model would consider the cost of actually exiting, which for a large position in
 the far wings is not the mid.
 
-**Single-source volatility data, end-of-day only.** One vendor, one snapshot per day, and
-the vendor's own implied vols turned out to be internally inconsistent enough that we
-recomputed them. A second source would be the obvious next check.
+**End-of-day only — though no longer single-source.** One snapshot per day in both cases.
+The original limitation was that a single vendor supplied everything, and that vendor's own
+implied vols turned out to be internally inconsistent enough to require recomputing. That
+check has since been run: Databento data for the same reference date agrees to a median
+$0.0000 in mid price and 0.0000 vol points in implied volatility, and does *not* reproduce
+the vendor's crossover kink. What remains is the daily-snapshot limitation itself — an
+end-of-day mark says nothing about the intraday path a real margin model would care about.
+
+**The second case has no external price benchmark of its own.** The 2023-12-29 case can be
+checked against two independent sources. The 2026-06-01 case rests on one, cross-validated
+only in the sense that the source was verified on a *different* date.
 
 ## Reading the results
 
@@ -263,3 +358,9 @@ Built in nine phases (0–8), one at a time, with a review gate after each. Phas
 reconstructed retroactively, since the project predates the repository; each was verified
 to run end to end from a clean checkout. See the *Version control* section of
 `PROJECT_LOG.md` for the details and caveats.
+
+A second reference case was added later, in four stages: a cross-vendor validation of the
+original reference date (Phase 9), a Databento pull and reshape (Stages A–B), a full
+independent run (Stage C), and the comparison above (Stage D). Configuration moved out of
+`main.py` into `configs/` at that point, and the original run was re-verified afterwards to
+reproduce all 17 of its output tables byte for byte.

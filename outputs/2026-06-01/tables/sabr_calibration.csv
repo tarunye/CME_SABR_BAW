@@ -1,0 +1,2 @@
+reference_date,expiry_date,forward,time_to_expiry_years,alpha,beta,rho,nu,rmse_vol_points,max_abs_error_vol_points,n_strikes,calibration_moneyness_band,volatility_source
+2026-06-01,2026-07-17,760.2244407963872,0.12602739726027398,0.13631139671450246,1.0,-0.6337124207005329,2.2013127343673213,0.2079999755242575,0.7962538251550078,125,0.15,reimplied_from_mid_prices

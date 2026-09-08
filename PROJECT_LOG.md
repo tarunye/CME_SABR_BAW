@@ -4,9 +4,10 @@ Running record of what has been built, decided, and deferred. Append-only: each 
 a section, nothing earlier gets rewritten. If you are picking this project up cold, read
 this file top to bottom and you will know exactly where things stand.
 
-**Current status: COMPLETE. Phases 0-6 and 8 built; Phase 7 skipped by choice.
-Phase 9 adds an independent cross-vendor validation of the reference date against
-Databento — no pipeline result changed.**
+**Current status: COMPLETE, with TWO independent reference cases. Phases 0-6 and 8
+built; Phase 7 skipped by choice. Phase 9 cross-validated the original reference date
+against a second data source. Stage D adds a full second run — 2026-06-01, Databento —
+and compares the two. No original result changed.**
 
 ---
 
@@ -1103,6 +1104,144 @@ need a daily pull.
 **Cost is not the constraint on this extension.** The loader work is: reducing minute bars
 to an EOD-equivalent snapshot and mapping OPRA definitions onto the
 `[QUOTE_DATE]/[EXPIRE_DATE]/[STRIKE]` schema. That work is identical at $8 or $424.
+
+---
+
+## STAGE D — Two independent reference cases, compared ✅ complete
+
+A second complete run of the same methodology, on a different data source, a different
+market regime and a different position. The point is not that the two answers agree —
+they should not, and do not — but that where they differ, the difference is attributable
+to the market rather than to the pipeline or the data feed.
+
+### The two runs
+
+| | 2023-12-29 (OptionsDX) | 2026-06-01 (Databento) |
+|---|---|---|
+| Expiry / DTE | 2024-02-16 / 49d | 2026-07-17 / 46d |
+| Spot | $475.31 | $758.54 |
+| Forward | $478.892 | $760.224 |
+| Risk-free `r` | 5.4000% | 3.6600% |
+| Cost of carry `b` | 5.5926% | 1.7601% |
+| Implied dividend yield `q` | **−0.1926%** | **+1.8999%** |
+| Carry regime | **`b > r`** | **`b < r`** |
+| SABR `alpha` | 0.109797 | 0.136311 |
+| SABR `rho` | −0.524225 | **−0.633712** |
+| SABR `nu` | 2.132810 | 2.201313 |
+| Fit RMSE (vol pts) | 0.2346 | **0.2080** |
+| Realised vol in window | 13.14% | 11.88% |
+| Skewness | −0.028 | −0.244 |
+| Excess kurtosis | **−0.178** | **+1.569** |
+| Worst / best day in window | −2.00% / +2.28% | −2.70% / +2.91% |
+| Position | +1 × $475 put | +1 × $759 put |
+| Position value | $6.6391 | $14.4221 |
+| **99% one-day VaR** | **$2.4488** | **$4.1216** |
+| **VaR as % of position** | **36.89%** | **28.58%** |
+| Expected shortfall | $2.5805 | $5.3674 |
+| Worst scenario P&L | −$2.7719 | −$6.0986 |
+| Stress-window VaR | $4.9321 (2020) | $5.2226 (2026-01-02) |
+| Stress / baseline | **2.01×** | **1.27×** |
+
+The dollar VaRs are not directly comparable: the positions differ in strike, in underlying
+level and marginally in moneyness sign (the 2023 put is 0.065% out of the money, the 2026
+put 0.061% *in*). **VaR as a percentage of position value is the like-for-like number**,
+and on that basis the second case is the *less* risky of the two — 28.58% against 36.89%.
+
+### Differences that are genuinely the market
+
+**The carry regime flips, and it is a calendar fact.** In 2023 no SPY ex-dividend date fell
+between reference and expiry, so the implied yield came out at −0.19% — near zero, as the
+original config predicted. In 2026 one does, and the implied yield is +1.90%. Stated in
+dollars rather than annualised, that is **$1.82 of dividend on a $758.54 underlying**,
+which is SPY's actual quarterly payout. Nothing in the calibration forced this; it falls
+out of put-call parity on the quotes.
+
+The consequence runs through the pricing. With `b > r` an American call has no
+early-exercise value at all, which is why the original chose a put. With `b < r` that
+reverses, and the put's early-exercise premium is larger here, not smaller — so the choice
+holds for the opposite reason.
+
+**Rates fell**, 5.40% to 3.66%, pinned externally from the same FRED DGS3MO series in both
+cases.
+
+**The skew steepened**, `rho` −0.524 to −0.634, and the volatility level rose, ATM implied
+11.76% to 13.94%, against *lower* realised volatility in the lookback window (13.14% to
+11.88%). A higher implied vol on a calmer realised window is a real feature of the 2026
+surface, not an artefact.
+
+**The tails changed shape, and this is the sharpest regime difference.** The 2023 window
+had excess kurtosis of **−0.178** — tails *thinner* than a normal distribution, no day
+beyond 3σ. The 2026 window has **+1.569**. The lookback windows are both calm by their own
+volatility measure, but the second one is calm in a fat-tailed way.
+
+**The stress comparison is weaker in the second case, and the reason is the dataset, not
+the market.** The original could reach 2020 and found a 2.01× ratio. The Databento pull
+spans seventeen months, so the harshest window available is the one containing the April
+2025 tariff selloff (−5.85%, then +10.50%), giving 1.27×. That is a smaller multiple
+because April 2025 was a smaller event than March 2020, not because the method behaved
+differently.
+
+### Differences that are the data source — bounded, and small
+
+The Phase 9 cross-check pulled Databento data for **2023-12-29 itself** and ran the
+project's own `imply_forward_from_parity` and `baw.implied_volatility` against it,
+unchanged. That measurement is what licenses the comparison above:
+
+| Quantity | Data-source difference on the same date |
+|---|---|
+| Median mid price, 151 common strikes | **$0.0000** |
+| Median re-implied IV | **0.0000 vol points** |
+| 95th percentile \|IV difference\| | 0.2286 vol points |
+| Parity forward | −$0.0425 (**0.89 bp**) |
+| Re-implied crossover gap | reproduced to **0.007 vol points** |
+
+Stage B removed one further source of doubt. `UNDERLYING_LAST` is SPY's observed
+consolidated close, not a derived quantity — and where the derivation was checked against
+it, the two agreed to a median $0.16 with a return correlation of **0.9954**.
+
+Set against differences of 68% in dollar VaR and 8.3 percentage points in VaR-to-position,
+a forward that agrees to 0.89 bp and IVs whose median difference is exactly zero cannot be
+carrying the result. **The two cases differ because the market differed.**
+
+One asymmetry is worth stating plainly rather than glossing: the 2026 "vendor IV" column is
+not a vendor's at all — it is the project's own European Black-76 inversion, added in
+Stage B because `build_otm_smile` filters on that column and Phase 0 runs before Phase 3
+can replace it. So the Phase 3 comparison means something different in each case. In 2023
+it measured *vendor error plus the European-to-American correction*; in 2026 it measures
+the correction alone, which is why the difference is smaller and one-signed (−0.0388 vol
+points across all strikes, against +0.1231 on puts and −0.0911 on calls in 2023).
+
+That same asymmetry supplies a clean confirmation of the Phase 9 finding. In 2023 the
+vendor's crossover gap was **+0.291 vol points — the wrong sign** against a downward-sloping
+smile, which no smooth curve can fit and which motivated re-implying in the first place. In
+2026, *both* the pre-correction and post-correction gaps carry the correct negative sign
+(−0.1227 and −0.0436). An internally consistent starting point does not produce the kink.
+The kink was OptionsDX's.
+
+### What the second case establishes
+
+1. **The methodology transfers.** `sabr.py`, `baw.py`, `historical_sim.py` and `var.py` ran
+   completely unchanged. Only `configs/` and the dataset moved.
+2. **The pipeline is not overfitted to its original inputs.** All 197 out-of-the-money
+   strikes inverted, none failed; the SABR fit is *better* on the new data (RMSE 0.2080 vs
+   0.2346).
+3. **The Phase 4 warning generalises.** The original argued a lookback window's severity
+   drives the answer by comparing 2020 against 2023. The second case shows the same effect
+   inside one continuous dataset: April 2025 sits at sessions 63–68, is inside the window
+   for reference dates up to about 2026-03, and has aged out by 2026-06-01 — the
+   1st-percentile return halving from −3.56% to −1.75% as it falls off the back.
+
+### What it does not establish
+
+- **One position each.** Two single options, not portfolios. Phase 7 remains skipped.
+- **The vol surface is still frozen** in both runs. Scenario P&L carries spot risk and the
+  smile's response to spot, no independent volatility risk. Unchanged limitation.
+- **The stress windows are not comparable to each other.** 2020 and April 2025 are
+  different magnitudes of event; the 2.01× and 1.27× ratios should not be read against one
+  another.
+- **The 2026 case has no external price benchmark.** The 2023 case could be checked against
+  OptionsDX *and* Databento. The 2026 case rests on one source, cross-checked only in the
+  sense that the source itself was validated on a different date.
 
 ---
 

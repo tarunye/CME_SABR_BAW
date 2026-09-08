@@ -1,0 +1,33 @@
+quantity,value
+Underlying,SPY (SPDR S&P 500 ETF Trust)
+Contract,"$759 put, expiry 2026-07-17"
+Quantity,+1 contract (long)
+Exercise style,American (BAW approximation)
+Reference date,2026-06-01
+SPY spot,$758.54
+Forward at expiry,$760.224  (from put-call parity)
+Time to expiry,0.12603 years (46 days)
+Risk-free rate,3.6600%  (FRED DGS3MO)
+Cost of carry b,1.7601%  (derived)
+alpha  (volatility level),0.136311
+"beta   (elasticity, fixed)",1.0000
+rho    (spot/vol correlation),-0.633712
+nu     (volatility of volatility),2.201313
+Fit quality,RMSE 0.2080 vol points over 125 strikes
+SABR implied volatility,13.9399%
+Theoretical price (SABR to BAW),$14.422074
+Market price (mid),$14.3600
+Difference,$+0.0621
+Position value,$14.4221
+Lookback window,2025-06-03 to 2026-06-01
+Scenarios,"250 (unweighted, full revaluation)"
+Realised volatility in window,11.88% annualised
+Worst daily move in window,-2.7028% on 2025-10-10
+99% one-day VaR,$4.1216   (28.58% of position)
+Expected shortfall,$5.3674   (mean of 3 breaches)
+Worst scenario in sample,$6.0986 loss
+...produced by,"2026-03-31, a +2.907% move"
+Stress-window VaR (2026),$5.2226   (1.3x baseline)
+Window contains no crisis,1st pctile return -1.75% vs -3.56% in a 2026 window
+BAW approximation error,"~1% of scenario P&L (measured, Phase 2)"
+Volatility surface,"frozen; spot risk only, no independent vol risk"
