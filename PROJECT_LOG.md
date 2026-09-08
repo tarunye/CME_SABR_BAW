@@ -34,25 +34,44 @@ Built in nine phases (0-8), one at a time, stopping for written approval after e
 | `baw.py` | Barone-Adesi & Whaley American pricer, European baseline, critical-price solver, binomial reference, and the validation suite | Phase 2 |
 | `historical_sim.py` | Daily returns, scenario generation, return-sample statistics, tail and lookback-window diagnostics | Phase 4 |
 | `var.py` | 99% VaR by explicit interpolation between order statistics, expected shortfall, and the rank-convention comparison | Phase 6 |
-| `plots.py` | One function per figure, all saving to `outputs/figures/` | Phase 0 |
+| `plots.py` | One function per figure, all saving to the running config's `figures_dir` | Phase 0 |
 | `requirements.txt` | Pinned dependency versions | Phase 8 |
 | `README.md` | Project overview, data sourcing, figure guide, consolidated assumptions, limitations | Phase 8 |
-| `main.py` | `CONFIG` block (every assumption, with sources) and the phase runners | Phase 0 |
-| `data/spy_eod_YYYY.parquet` | Raw vendor data, 2010-2023 (supplied, not generated) | — |
+| `main.py` | The phase runners, and the loader that reads a config | Phase 0 |
+| `configs/config_2023_12_29.py` | Every assumption for the original case, with sources. Was the `CONFIG` block in `main.py` until Stage C | Phase 0, moved in Stage C |
+| `configs/config_2026_06_01.py` | The same for the Databento case | Stage C |
+| `databento_pullers/databento_cost_check*.py` | `metadata.get_cost` probes: single day, full range, and the 2025-2026 period | Phase 9 |
+| `databento_pullers/databento_pull_2025_2026.py` | The pull itself — calendar, DST-aware close windows, early closes, one-off closures, submission, download, verification | Phase 9 |
+| `databento_pullers/databento_validation_20231229.py` | The cross-vendor check of the original reference date | Phase 9 |
+| `databento_pullers/databento_sanity_check.py` | Coverage, content, window and quality checks over the whole pull | Phase 9 |
+| `databento_pullers/databento_reshape.py` | Join, EOD collapse and reshape into this project's dataset layout | Stage B |
+| `data/spy_eod_YYYY.parquet` | Raw OptionsDX data, 2010-2023 (supplied, not generated) | — |
+| `data/raw_databento_2025_2026/` | Raw Databento pull: per-session quotes and definitions (gitignored) | Phase 9 |
+| `data/databento_2025_2026/` | The reshaped Databento dataset, in the same layout `data_loader` reads (gitignored) | Stage B |
 | `data/*.csv` | Cached derived pulls, regenerated if deleted | Phase 0 |
-| `outputs/figures/` | All `.png` output | Phase 0 |
-| `outputs/tables/` | All `.csv` output | Phase 0 |
+| `outputs/2023-12-29/{figures,tables}` | All output for the original case | Phase 0 |
+| `outputs/2026-06-01/{figures,tables}` | All output for the Databento case | Stage C |
 
-**Run everything with `python3 main.py`.** Individual modules with a standalone block can
-also be run alone: `python3 sabr.py`, `python3 historical_sim.py`, `python3 var.py`, and
-`python3 baw.py` (the last takes ~30s — it runs thousands of binomial lattices — and is
-not part of the pipeline).
+**Run a case with `python3 main.py <config>`:**
+
+```bash
+python3 main.py                      # 2023-12-29, OptionsDX  (the default)
+python3 main.py config_2026_06_01    # 2026-06-01, Databento
+```
+
+Each case writes to its own directory under `outputs/`, so runs never overwrite one
+another. Individual modules with a standalone block can also be run alone: `python3
+sabr.py`, `python3 historical_sim.py`, `python3 var.py`, and `python3 baw.py` (the last
+takes ~30s — it runs thousands of binomial lattices — and is not part of the pipeline).
 
 ---
 
 ## Reference configuration
 
-All of this lives in the `CONFIG` dict at the top of `main.py`.
+All of this lives in `configs/config_2023_12_29.py`. It sat in a `CONFIG` dict at the
+top of `main.py` until the second reference case was added; the values did not change
+when it moved, and the run was re-verified afterwards to reproduce all 17 of its output
+tables byte for byte.
 
 | Quantity | Value | Source |
 |---|---|---|
@@ -111,7 +130,7 @@ implied volatility smile, and plots it.
   64.20%.
 - Forward implied from 22 liquid strikes with a standard deviation of $0.203 (~4bp of
   spot). That tightness is the evidence the method worked.
-- `outputs/figures/vol_smile_raw.png` shows a textbook equity index skew: monotone decline
+- `outputs/2023-12-29/figures/vol_smile_raw.png` shows a textbook equity index skew: monotone decline
   from 64% on the far left wing to a 9.9% minimum near the 500-505 strikes, then turning
   up through the call wing. Put and call legs join seamlessly at the forward (11.2% /
   11.7%), confirming the OTM stitching is correct.
@@ -893,7 +912,7 @@ generated their data: `spy_price_history.png` (Phase 4), `sabr_fit.png` (Phases 
 | `pnl_timeseries.png` | **8** |
 | `summary_table.png` | **8** |
 
-**16 tables** in `outputs/tables/`, including `summary.csv` as the machine-readable twin
+**16 tables** in `outputs/2023-12-29/tables/`, including `summary.csv` as the machine-readable twin
 of the summary image.
 
 ### Two rendering bugs found and fixed
@@ -933,7 +952,7 @@ A second source would be the obvious next check."* That check has now been run.
 | `databento_cost_check_full.py` | Full-range quote plus quarterly sampled per-day costs |
 | `databento_cost_check_2025.py` | Same for a proposed 2025-06-25 → 2026-06-25 period; reuses `data_loader.nyse_trading_days` |
 | `databento_validation_20231229.py` | The cross-check itself: joins definition × cbbo-1m and compares against Phase 0–3 outputs |
-| `outputs/tables/databento_iv_comparison.csv` | Per-strike IV comparison, 151 common strikes |
+| `outputs/2023-12-29/tables/databento_iv_comparison.csv` | Per-strike IV comparison, 151 common strikes |
 
 `metadata.get_cost` is free, so every cost figure below was established before spending
 anything. **Total spent: $0.0390** — definition $0.014256, cbbo-1m $0.024694.
@@ -1104,6 +1123,49 @@ need a daily pull.
 **Cost is not the constraint on this extension.** The loader work is: reducing minute bars
 to an EOD-equivalent snapshot and mapping OPRA definitions onto the
 `[QUOTE_DATE]/[EXPIRE_DATE]/[STRIKE]` schema. That work is identical at $8 or $424.
+
+---
+
+## Actual data acquisition cost
+
+The Phase 9 section above records what `metadata.get_cost` **estimated** before anything
+was pulled. Those figures are left as they were written, because the estimates are part of
+the decision record — but they are estimates, and they are not what was billed. This
+section is the billed total, read back from the job details Databento returns, not from
+`get_cost`.
+
+**Total: $8.1104.**
+
+| What | Detail | Billed |
+|---|---|---|
+| Phase 9 cross-check | 2023-12-29: one definition day + one 3-minute cbbo-1m window | $0.0390 |
+| cbbo-1m, the pull | 353 batch jobs, one per session, 2025-01-02 → 2026-06-01 | $1.6446 |
+| Definitions, quarterly | 7 anchor days, superseded by the full-range pull below | $0.1245 |
+| Definitions, full range | 1 batch job, split per day — closed the coverage gap | **$6.3413** |
+| SPY daily close | `EQUS.SUMMARY` + `ARCX.PILLAR`, `ohlcv-1d`, one call each | $0.0011 |
+| | | **$8.1104** |
+
+Two things this breakdown says that the estimates did not.
+
+**The reference data cost four times the quote data.** $6.34 against $1.64. That is the
+price of closing the definition coverage gap: quarterly anchors left up to 11% of quotes
+unmatched by early 2026, and only a per-day definition snapshot for every session brings
+the match rate to 100.0000%. Worth knowing for any future period — if a rebuild needs only
+a handful of reference dates rather than all 353, single-day definition pulls at roughly
+$0.019 each are far cheaper than buying the whole history.
+
+**`get_cost` over-estimates narrow intraday windows, and prices whole days exactly.** The
+3-minute cbbo-1m windows were estimated at about $0.033 per session and billed $0.004659 —
+roughly 7× less. The full-range definition job was estimated at $6.3413 and billed
+$6.34126178920269, identical to eight decimal places. Both were batch jobs, so this is not
+a batch-versus-streaming discount: the plausible reading is that `get_cost` cannot know how
+sparse a three-minute slice will be and prices it coarsely, while a whole-day definition
+request is deterministic. Two data points, one hypothesis — a batched whole-day quote job
+would settle it and has not been run.
+
+For context on scale rather than precision: one contiguous pull of every hour rather than
+the pre-close window was estimated at $168.08 for a comparable year, about 20× more, for
+data the pipeline discards since it consumes one snapshot per session.
 
 ---
 

@@ -25,8 +25,11 @@ import os
 CONFIG = {
     # ---- Paths -----------------------------------------------------------------------
     "data_dir": "data",
-    "figures_dir": os.path.join("outputs", "figures"),
-    "tables_dir": os.path.join("outputs", "tables"),
+    # Namespaced by reference date, the same way config_2026_06_01.py is, so the two
+    # cases can never overwrite one another. These paths moved when the second case was
+    # added; the values they contain did not.
+    "figures_dir": os.path.join("outputs", "2023-12-29", "figures"),
+    "tables_dir": os.path.join("outputs", "2023-12-29", "tables"),
 
     # ---- Reference date and expiry ---------------------------------------------------
     # 2023-12-29 is the last quote date in the OptionsDX files we hold. Working from the

@@ -186,7 +186,7 @@ adding a file to `configs/`, never editing `main.py`.
 | `baw.py` | Barone-Adesi & Whaley American pricer, European baseline, critical-price solver, implied-volatility inverter, a binomial reference pricer, and a ten-check validation suite |
 | `historical_sim.py` | Daily returns, scenario generation, and the return-sample diagnostics |
 | `var.py` | 99% VaR by explicit interpolation between order statistics, expected shortfall, and the rank-convention comparison |
-| `plots.py` | One function per figure, all saving to `outputs/figures/` |
+| `plots.py` | One function per figure, all saving to the running config's `figures_dir` |
 | `main.py` | The phase-by-phase pipeline, and the runner that loads a config |
 | `configs/` | One config per reference case: `config_2023_12_29.py`, `config_2026_06_01.py` |
 | `databento_pullers/` | Cost checks, the Databento pull, the reshape into this project's dataset format, and the validation and sanity-check scripts |
@@ -348,8 +348,9 @@ each phase, the key finding from each, every judgement call with its reasoning, 
 found along the way — including several sign errors I made and corrected after checking
 against numbers — and the consolidated assumptions table.
 
-Outputs land in `outputs/figures/` and `outputs/tables/`. These *are* committed, so the
-repository is reviewable without the underlying dataset.
+Outputs land in `outputs/2023-12-29/` and `outputs/2026-06-01/`, each with its own
+`figures/` and `tables/`. These *are* committed, so the repository is reviewable without
+either underlying dataset.
 
 ## Provenance
 

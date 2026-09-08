@@ -40,6 +40,14 @@ __pycache__/
 venv/
 
 # ---------------------------------------------------------------------------
+# Session artefacts
+# ---------------------------------------------------------------------------
+# Exported chat transcripts of the sessions that built this project. Useful to
+# keep locally, but they are a record of HOW the work was done rather than part
+# of the work, and PROJECT_LOG.md is the account meant to be read.
+transcript/
+
+# ---------------------------------------------------------------------------
 # OS and editor noise
 # ---------------------------------------------------------------------------
 .DS_Store
