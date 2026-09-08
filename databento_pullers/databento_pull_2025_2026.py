@@ -411,6 +411,44 @@ def pull_definitions_fullrange(c):
     return fs
 
 
+EQUITY_DIR = _os.path.join(OUT_ROOT, "equities")
+
+# The underlying close. OPRA carries no underlying price, so SPY's daily close
+# comes from an equities dataset. EQUS.SUMMARY is the CONSOLIDATED national
+# close, which is what "SPY closed at X" conventionally means and what the
+# OptionsDX UNDERLYING_LAST field approximates.
+#
+# ARCX.PILLAR was pulled alongside it as a cross-check on the theory that SPY's
+# primary listing venue gives the most official close. It does not: an
+# ohlcv-1d bar from one venue is the last print in that venue's bar window, not
+# the closing-auction price, and it diverged from the consolidated close by up
+# to $19.62 with a return correlation of only 0.910. Kept for the record; not
+# used.
+EQUITY_DATASETS = ["EQUS.SUMMARY", "ARCX.PILLAR"]
+EQUITY_CLOSE_DATASET = "EQUS.SUMMARY"
+
+
+def pull_spy_daily_close(c):
+    """One ohlcv-1d bar per session for SPY, from each equities dataset."""
+    _os.makedirs(EQUITY_DIR, exist_ok=True)
+    days = trading_days()
+    start, end = days[0], "2026-06-02"          # exclusive end
+    out = []
+    for ds in EQUITY_DATASETS:
+        path = _os.path.join(EQUITY_DIR, f"spy_ohlcv1d_{ds.replace('.', '_')}.dbn.zst")
+        if _os.path.exists(path) and _os.path.getsize(path) > 0:
+            print(f"  {ds}: already present, skipping")
+            out.append(path)
+            continue
+        cost = c.metadata.get_cost(dataset=ds, start=start, end=end, symbols="SPY",
+                                   schema="ohlcv-1d", stype_in="raw_symbol")
+        c.timeseries.get_range(dataset=ds, start=start, end=end, symbols="SPY",
+                               schema="ohlcv-1d", stype_in="raw_symbol").to_file(path)
+        print(f"  {ds}: ${cost:.6f} -> {_os.path.basename(path)}")
+        out.append(path)
+    return out
+
+
 def verify():
     """Coverage, cost and record counts, read back from disk and job details."""
     days = trading_days()
@@ -455,6 +493,8 @@ def main(argv):
     if cmd in ("definitions", "all"):
         pull_definitions(c, trading_days())
         pull_definitions_fullrange(c)
+    if cmd in ("equities", "all"):
+        pull_spy_daily_close(c)
     if cmd in ("submit", "all"):
         submit_all(c)
     if cmd in ("download", "all"):

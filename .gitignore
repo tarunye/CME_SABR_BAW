@@ -15,6 +15,13 @@ data/*.parquet
 #   python3 databento_pullers/databento_pull_2025_2026.py all
 data/raw_databento_2025_2026/
 
+# The reshaped Databento dataset, in the vendor's column layout so data_loader
+# reads it unchanged. Derived from the raw pull above and reproducible with
+#   python3 databento_pullers/databento_reshape.py
+# so it is a cache, not source -- but data/*.csv above is also single-level and
+# would not catch it either.
+data/databento_2025_2026/
+
 # ---------------------------------------------------------------------------
 # Derived caches
 # ---------------------------------------------------------------------------
