@@ -4,7 +4,9 @@ Running record of what has been built, decided, and deferred. Append-only: each 
 a section, nothing earlier gets rewritten. If you are picking this project up cold, read
 this file top to bottom and you will know exactly where things stand.
 
-**Current status: COMPLETE. Phases 0-6 and 8 built; Phase 7 skipped by choice.**
+**Current status: COMPLETE. Phases 0-6 and 8 built; Phase 7 skipped by choice.
+Phase 9 adds an independent cross-vendor validation of the reference date against
+Databento — no pipeline result changed.**
 
 ---
 
@@ -910,6 +912,197 @@ of the summary image.
 Cold run from deleted caches completes in ~9 seconds; all five entry points exit 0
 (`main.py`, `sabr.py`, `baw.py`, `historical_sim.py`, `var.py`), and `baw.py`'s ten-check
 suite passes.
+
+---
+
+## PHASE 9 — Independent data validation against Databento ✅ complete
+
+A cross-vendor correctness test of the reference date, run before deciding whether to
+extend the project to a second reference period sourced from Databento. Not a data
+extension: one day, $0.0390 of metadata-priced pulls, no change to any pipeline result.
+
+This addresses README limitation #5 — *"Single-source volatility data, end-of-day only...
+A second source would be the obvious next check."* That check has now been run.
+
+### What was built
+
+| File | Responsibility |
+|---|---|
+| `databento_cost_check.py` | Single-day `metadata.get_cost` probe, DST-aware close window |
+| `databento_cost_check_full.py` | Full-range quote plus quarterly sampled per-day costs |
+| `databento_cost_check_2025.py` | Same for a proposed 2025-06-25 → 2026-06-25 period; reuses `data_loader.nyse_trading_days` |
+| `databento_validation_20231229.py` | The cross-check itself: joins definition × cbbo-1m and compares against Phase 0–3 outputs |
+| `outputs/tables/databento_iv_comparison.csv` | Per-strike IV comparison, 151 common strikes |
+
+`metadata.get_cost` is free, so every cost figure below was established before spending
+anything. **Total spent: $0.0390** — definition $0.014256, cbbo-1m $0.024694.
+
+### The data
+
+`OPRA.PILLAR`, parent symbology `SPY.OPT`. Two pulls for 2023-12-29:
+
+- **definition**, full 24h UTC day (the docs state definition cost is only accurate in
+  24-hour multiples, so it is not narrowed). 8,504 instruments.
+- **cbbo-1m**, 20:57–21:00 UTC. 2023-12-29 is EST, so the 16:00 ET close is 21:00 UTC;
+  the conversion is done with `zoneinfo`, never a hardcoded offset. The closing-minute
+  bar (ts_recv 20:59, covering 15:59–16:00 ET) is the snapshot used.
+
+Definition supplies strike, expiry and put/call for each `instrument_id`; without it the
+cbbo rows are numeric IDs with no strike attached. **312 definitions** for expiry
+2024-02-16 joined to the closing bar gave **156 strikes with both legs — exactly the 156
+the project has.** The join was verified independently: the OSI symbol carried on each
+quote matches the symbol on its definition for all 312 instruments, **0 mismatches**.
+
+### Result: the existing numbers are corroborated
+
+The project's own `imply_forward_from_parity` and `baw.implied_volatility` were run
+**unchanged** on Databento quotes, so every difference below is attributable to the data
+rather than to the method.
+
+| Quantity | Project (OptionsDX) | Databento (OPRA) | Difference |
+|---|---|---|---|
+| Chain strikes, 2024-02-16 | 156 | 156 | 0 |
+| Parity forward | $478.8920 | $478.8495 | **−$0.0425** (−0.89 bp) |
+| Forward dispersion | $0.203 (22 strikes) | $0.182 (32 strikes) | tighter |
+| Implied dividend yield | −0.1926% | −0.1265% | +0.066 pp |
+| Implied spot | $475.31 | $475.2678 | −$0.0422 |
+| $475 put bid/ask | 6.51 / 6.54 | 6.58 / 6.61 | mid **+$0.0700** |
+| BAW theoretical − market mid | +$0.1141 | +$0.0441 | Databento closer to theory |
+| Re-implied IV, median difference | — | — | **0.0000 vol pts** |
+| Re-implied IV, mean difference | — | — | −0.0168 vol pts |
+| Re-implied IV, 95th pctile \|diff\| | — | — | 0.2286 vol pts |
+| Strikes differing > 1 vol point | — | — | **1 of 151** |
+| Crossed OTM quotes | **2** (K=477, 478) | **0** | — |
+
+Every difference is inside normal cross-vendor noise. Median mid difference across the 151
+common strikes is **$0.0000** and median IV difference is **0.0000 vol points**.
+
+Two entries deserve their own note:
+
+- **The $0.07 on the $475 put** is the largest *positive* mid difference in the sample
+  (which ranges −$0.225 to +$0.070), and it lands on the one contract the headline VaR
+  rests on. In IV terms it is **+0.104 vol points**. Both vendors quote a 3-cent spread;
+  the difference is snapshot timing — OptionsDX stamps 16:00, Databento's bar covers
+  15:59–16:00.
+- **The single >1 vol point outlier** is K=260, a deep-wing penny put: Databento 0.01/0.02
+  against the project's mid $0.025. A **one-cent** disagreement amplified into 2.36 vol
+  points by near-zero vega. Not a data defect.
+
+The −$0.0422 "implied spot" difference is not an independent measurement. OPRA carries no
+underlying equity price, so spot cannot be read from this data at all; the figure is the
+forward difference propagated back through the carry, and is the same number.
+
+### The crossover: Phase 3's diagnosis confirmed, its metric found fragile
+
+This is the substantive finding, and it splits into three parts.
+
+**1. The vendor's wrong-sign kink was an artefact.** Phase 1 and Phase 3 found the
+OptionsDX vendor IVs stepping **+0.291 vol points upward** across a downward-sloping
+smile — the impossible shape that motivated re-implying the vols in the first place.
+Databento does not reproduce it. Relatedly, the **two crossed put quotes at K=477 and
+K=478** (bid 7.36/ask 7.33 and 7.78/7.77) that forced those strikes out of the smile are
+**clean and two-sided in Databento** (7.37/7.40 and 7.80/7.83). Zero crossed quotes in the
+whole OTM chain. Both were OptionsDX defects.
+
+**2. The Phase 3 fix was right.** Like-for-like on the same 476→479 pair, the re-implied
+adjacent gap is **−0.2088** for the project and **−0.2164** for Databento. Independent
+data reproduces the corrected number to 0.008 vol points.
+
+**3. The residual inconsistency is real — and the number in assumption #15 is not.**
+Because Databento has clean quotes at 477 and 478, the crossover can be measured across a
+**$1 gap** rather than extrapolated across the $3 hole that assumption #17 flags as
+unreliable. Measuring the residual as *adjacent gap minus what the put wing's slope
+predicts*, using a **fitted slope over strikes 470 to the last put**:
+
+| | Adjacent gap | Fitted wing slope | Predicted gap | **Residual** |
+|---|---|---|---|---|
+| Project, 476→479 ($3) | −0.2088 | −0.1264 /$1 | −0.3792 | **+0.1704** |
+| Databento, 476→479 ($3) | −0.2164 | −0.1287 /$1 | −0.3860 | **+0.1697** |
+| Databento, 478→479 ($1) | +0.0208 | −0.1254 /$1 | −0.1254 | **+0.1462** |
+
+All in vol points. The two vendors agree on identical strikes to **0.0007 vol points**,
+and closing the $3 hole moves the answer by only 0.024. **The residual put/call
+inconsistency is a real market feature of roughly +0.15 vol points, not an OptionsDX
+artefact.** Phase 3's conclusion stands, and the ~20%-explained-by-early-exercise
+diagnosis with it.
+
+**But `slope_implied_gap` should not be trusted.** `put_call_crossover_step` predicts the
+gap from a **two-point** local slope — the last two put quotes only — deliberately, to
+keep the measure local. On this date that choice backfires:
+
+| | Two-point slope | Predicted gap | Residual |
+|---|---|---|---|
+| Project, 476→479 | −0.0193 /$1 | −0.0578 | **−0.1510** |
+| Databento, 476→479 | −0.1084 /$1 | −0.3253 | **+0.1089** |
+| Databento, 478→479 | −0.1126 /$1 | −0.1126 | **+0.1334** |
+
+The residual **changes sign between vendors on the same strikes**. The cause is a single
+quote: the 475→476 put IV step is **−0.0193** vol points in OptionsDX against **−0.1084**
+in Databento, because the OptionsDX 475 put mid is 7 cents low. A two-point slope has no
+averaging, so a one-cent quote error propagates undamped into the prediction — here it
+flattened the slope 5.6× and flipped the residual's sign.
+
+The **fitted-slope** version is stable across vendors (+0.1704 vs +0.1697) and across
+strike pairs (+0.1697 vs +0.1462). It is the measure to use.
+
+### Supersedes
+
+Per this file's append-only convention, the consolidated assumptions table below is left
+as written. Two of its rows should now be read with this section alongside them:
+
+- **Assumption #15** states the residual gap as "−0.209 vs −0.058 predicted by the local
+  slope". The −0.209 is confirmed. **The −0.058 is unreliable** — it comes from a
+  two-point slope distorted by one 7-cent quote, and a second vendor puts the same
+  quantity at −0.3253. The residual is better stated as **+0.15 vol points** from a fitted
+  wing slope, which both vendors agree on.
+- **Assumption #17** states the extrapolated crossover step is unreliable because crossed
+  quotes at 477 and 478 leave a $3 hole. Still true of the OptionsDX data. **Databento has
+  clean quotes at both strikes**, so on a Databento-sourced rebuild the hole does not
+  exist and this assumption can be retired.
+
+Nothing in Phases 0–8 is changed by this. No pipeline number moves; `main.py` was not
+touched.
+
+### What this does and does not establish
+
+**Does:** the OptionsDX-derived reference state is independently corroborated; the
+instrument_id → strike/expiry/type mapping works; the project's parity and BAW-inversion
+code runs unchanged against Databento data and produces consistent results; the Phase 3
+re-implying decision was correct; the residual crossover inconsistency is a genuine market
+feature.
+
+**Does not:** validate any date other than 2023-12-29. It is one snapshot. A Databento
+rebuild of a 2025–2026 period would be resting on a mapping confirmed on a single day —
+about 3 cents buys a second date, and that is worth doing before trusting a period with no
+ground truth behind it.
+
+Also unestablished: Databento's cbbo-1m is a *consolidated BBO at a minute boundary*,
+which is not the same object as an OptionsDX end-of-day snapshot. They agree closely here,
+but a rebuild would need a documented rule for reducing minute bars to an EOD-equivalent
+quote, and that rule is a modelling decision, not a data pull.
+
+### Cost of a Databento-sourced period, for reference
+
+Established from `metadata.get_cost` only, no data pulled. Per-day cbbo-1m cost rises with
+the SPY chain — **+42.1%** across 2024–2026 and **+55.2%** across 2025-06-25 → 2026-06-25 —
+so a single sampled day materially understates a year. Sampling quarterly:
+
+| Period | Trading days | Per-day mean | cbbo-1m total | + definition (4–12 pulls) |
+|---|---|---|---|---|
+| 2025-06-25 → 2026-06-25 | 252 (from `nyse_trading_days`) | $0.033284 | $8.39 | **$8.45 – $8.57** |
+| 2024-01-01 → 2026-09-05 | ~670 | $0.030560 | $20.48 | **$20.63 – $20.97** |
+
+One contiguous pull of *every hour* rather than the pre-close window costs **$168.08** and
+**$423.61** for those two ranges — about 20× more for data the pipeline discards, since it
+consumes one snapshot per day.
+
+Definition cost is roughly flat (~$0.015/day) because its records are one-per-instrument
+rather than volume-driven, and instrument definitions are largely static, so it does not
+need a daily pull.
+
+**Cost is not the constraint on this extension.** The loader work is: reducing minute bars
+to an EOD-equivalent snapshot and mapping OPRA definitions onto the
+`[QUOTE_DATE]/[EXPIRE_DATE]/[STRIKE]` schema. That work is identical at $8 or $424.
 
 ---
 

@@ -7,6 +7,14 @@
 # for where to download them.
 data/*.parquet
 
+# The Databento OPRA pull for the 2025-2026 second reference period (~363 MB:
+# per-day CBBO-1m quote snapshots and per-day instrument definitions). Same two
+# reasons as above -- too large for GitHub, and not ours to redistribute. The
+# patterns above are single-level globs and do not reach into this subtree, so
+# it needs its own entry. Reproduce it with
+#   python3 databento_pullers/databento_pull_2025_2026.py all
+data/raw_databento_2025_2026/
+
 # ---------------------------------------------------------------------------
 # Derived caches
 # ---------------------------------------------------------------------------
