@@ -1,0 +1,11 @@
+# Derived caches: regenerated automatically by make_figures.py. The binomial
+# lattice grid behind fig_baw_accuracy takes ~70s to recompute, hence the cache,
+# but it is derived data and the project does not track derived data.
+figures/_cache_*.csv
+
+# LaTeX build intermediates. paper.pdf itself IS tracked, so the compiled paper
+# is reviewable without a TeX install.
+*.aux
+*.out
+*.log
+*.synctex.gz
