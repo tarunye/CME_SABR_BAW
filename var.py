@@ -334,30 +334,66 @@ def describe_var(result, scenarios, confidence_level=0.99, label="VaR"):
               f"its 1st percentile scenario.")
 
 
-def _run_standalone():
+def _run_standalone(config_name=None):
     """
     Compute the VaR from the Phase 5 revaluation table. Entry point for `python3 var.py`.
+
+    Takes the same argument main.py does:
+
+        python3 var.py                    -> the default case
+        python3 var.py config_2026_06_01  -> the Databento case
+
+    Inputs:
+        config_name (str or None): config module name without the .py. None means the
+            default case.
 
     Returns:
         None. Prints the result.
     """
+    import importlib.util
     import os
 
-    path = os.path.join("outputs", "tables", "scenario_revaluation.csv")
+    # Same config loading as main.py, by file path rather than by importing main --
+    # main.py imports this module, so importing it back would close the import graph.
+    # Duplicated across the standalone blocks deliberately: each one stays runnable
+    # with nothing from the pipeline behind it. Default matches main.DEFAULT_CONFIG.
+    config_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
+    config_name = config_name or "config_2023_12_29"
+    config_path = os.path.join(config_dir, f"{config_name}.py")
+    if not os.path.exists(config_path):
+        available = sorted(f[:-3] for f in os.listdir(config_dir)
+                           if f.endswith(".py") and not f.startswith("__"))
+        raise SystemExit(f"No such config: {config_path}\n"
+                         f"Available: {', '.join(available) or '(none)'}")
+    spec = importlib.util.spec_from_file_location(config_name, config_path)
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
+    config = config_module.CONFIG
+
+    path = os.path.join(config["tables_dir"], "scenario_revaluation.csv")
 
     if not os.path.exists(path):
+        command = "python3 main.py"
+        if config_name != "config_2023_12_29":
+            command += f" {config_name}"
         raise FileNotFoundError(
-            f"Missing pipeline output. Run `python3 main.py` first to produce\n  {path}"
+            f"Missing pipeline output. Run `{command}` first to produce\n  {path}"
         )
 
     revaluation = pd.read_csv(path, parse_dates=["historical_date"])
 
-    result = compute_var(revaluation["scenario_pnl"], confidence_level=0.99)
+    confidence_level = config["confidence_level"]
+    result = compute_var(revaluation["scenario_pnl"], confidence_level=confidence_level)
 
-    describe_var(result, revaluation, confidence_level=0.99, label="2023 baseline window")
+    # Derived from the config, not a literal: a hardcoded year here would label the
+    # 2026 run's numbers as the 2023 window's, which is exactly what a reader uses
+    # this line to tell the two runs apart.
+    label = f"{config['reference_date'][:4]} baseline window"
+    describe_var(result, revaluation, confidence_level=confidence_level, label=label)
 
     print()
-    numpy_quantile = cross_check_against_numpy(revaluation["scenario_pnl"], 0.99)
+    numpy_quantile = cross_check_against_numpy(revaluation["scenario_pnl"],
+                                               confidence_level)
     print(f"  Cross-check against numpy.percentile: {numpy_quantile:+.10f}")
     print(f"  Our own arithmetic                  : {result['quantile_pnl']:+.10f}")
     print(f"  Difference                          : "
@@ -365,4 +401,6 @@ def _run_standalone():
 
 
 if __name__ == "__main__":
-    _run_standalone()
+    import sys
+
+    _run_standalone(sys.argv[1] if len(sys.argv) > 1 else None)

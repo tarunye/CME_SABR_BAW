@@ -431,30 +431,59 @@ def check_atm_branch_continuity(forward, time_to_expiry, alpha, beta, rho, nu):
     }
 
 
-def _run_standalone():
+def _run_standalone(config_name=None):
     """
     Calibrate against the Phase 0 smile and write the fit plot. Entry point for
     `python3 sabr.py`.
 
-    Reads the two small tables Phase 0 leaves in outputs/tables/ rather than re-deriving
-    the market state, so this module stays independent of the pipeline in main.py.
+    Reads the two small tables Phase 0 leaves in the running config's `tables_dir`
+    rather than re-deriving the market state, so this module stays independent of the
+    pipeline in main.py. Takes the same argument main.py does:
+
+        python3 sabr.py                     -> configs/config_2023_12_29.py (the default)
+        python3 sabr.py config_2026_06_01   -> configs/config_2026_06_01.py
+
+    Inputs:
+        config_name (str or None): config module name without the .py. None means the
+            default case.
 
     Returns:
-        None. Prints the calibration and writes outputs/figures/sabr_fit.png.
+        None. Prints the calibration and writes sabr_fit.png into the config's
+        figures_dir.
     """
+    import importlib.util
     import os
 
     import pandas as pd
 
     import plots
 
+    # The config is loaded by file path, the same way main.py does it, rather than by
+    # importing main. main.py imports this module, so importing it back would close the
+    # import graph -- and the point of a standalone block is that it needs nothing from
+    # the pipeline. The default below is main.DEFAULT_CONFIG; keep the two in step.
+    config_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
+    config_name = config_name or "config_2023_12_29"
+    config_path = os.path.join(config_dir, f"{config_name}.py")
+    if not os.path.exists(config_path):
+        available = sorted(f[:-3] for f in os.listdir(config_dir)
+                           if f.endswith(".py") and not f.startswith("__"))
+        raise SystemExit(f"No such config: {config_path}\n"
+                         f"Available: {', '.join(available) or '(none)'}")
+    spec = importlib.util.spec_from_file_location(config_name, config_path)
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
+    config = config_module.CONFIG
+    tables_dir = config["tables_dir"]
+    figures_dir = config["figures_dir"]
+
     # Prefer the re-implied smile if the pipeline has produced one. Phase 3 replaces the
     # vendor's implied vols with volatilities we invert ourselves, and those are what the
     # pipeline calibrates to -- so running this file standalone should report the same
     # parameters as `python3 main.py`, not the superseded vendor-IV ones.
-    reimplied_path = os.path.join("outputs", "tables", "reimplied_smile.csv")
-    vendor_path = os.path.join("outputs", "tables", "market_smile.csv")
-    state_path = os.path.join("outputs", "tables", "reference_market_state.csv")
+    reimplied_path = os.path.join(tables_dir, "reimplied_smile.csv")
+    vendor_path = os.path.join(tables_dir, "market_smile.csv")
+    state_path = os.path.join(tables_dir, "reference_market_state.csv")
 
     if os.path.exists(reimplied_path):
         smile_path = reimplied_path
@@ -464,8 +493,11 @@ def _run_standalone():
         volatility_source = "vendor implied vols (Phase 0)"
 
     if not os.path.exists(smile_path) or not os.path.exists(state_path):
+        command = "python3 main.py"
+        if config_name != "config_2023_12_29":
+            command += f" {config_name}"
         raise FileNotFoundError(
-            f"Missing pipeline output. Run `python3 main.py` first to produce\n"
+            f"Missing pipeline output. Run `{command}` first to produce\n"
             f"  {smile_path}\n  {state_path}"
         )
 
@@ -505,9 +537,11 @@ def _run_standalone():
         spot=float(state["spot"]),
         reference_date=str(state["reference_date"]),
         expiry_date=str(state["expiry_date"]),
-        output_path=os.path.join("outputs", "figures", "sabr_fit.png"),
+        output_path=os.path.join(figures_dir, "sabr_fit.png"),
     )
 
 
 if __name__ == "__main__":
-    _run_standalone()
+    import sys
+
+    _run_standalone(sys.argv[1] if len(sys.argv) > 1 else None)

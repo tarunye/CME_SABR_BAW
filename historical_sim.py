@@ -353,25 +353,54 @@ def rolling_window_statistics(returns, reference_dates, lookback_days=250):
     return pd.DataFrame(rows)
 
 
-def _run_standalone():
+def _run_standalone(config_name=None):
     """
     Generate and summarise scenarios on their own. Entry point for
     `python3 historical_sim.py`.
 
-    Reads the cached price history Phase 0 leaves in `data/`, so this module can be run and
-    reviewed without touching the option-pricing side of the project at all.
+    Reads the cached price history Phase 0 leaves in the config's `data_dir`, so this
+    module can be run and reviewed without touching the option-pricing side of the
+    project at all. Takes the same argument main.py does:
+
+        python3 historical_sim.py                    -> the default case
+        python3 historical_sim.py config_2026_06_01  -> the Databento case
+
+    Inputs:
+        config_name (str or None): config module name without the .py. None means the
+            default case.
 
     Returns:
         None. Prints the summary and writes no files.
     """
+    import importlib.util
     import os
 
-    price_path = os.path.join("data", "spy_price_history.csv")
-    state_path = os.path.join("outputs", "tables", "reference_market_state.csv")
+    # Same config loading as main.py, by file path rather than by importing main --
+    # main.py imports this module, so importing it back would close the import graph.
+    # Duplicated across the standalone blocks deliberately: each one stays runnable
+    # with nothing from the pipeline behind it. Default matches main.DEFAULT_CONFIG.
+    config_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
+    config_name = config_name or "config_2023_12_29"
+    config_path = os.path.join(config_dir, f"{config_name}.py")
+    if not os.path.exists(config_path):
+        available = sorted(f[:-3] for f in os.listdir(config_dir)
+                           if f.endswith(".py") and not f.startswith("__"))
+        raise SystemExit(f"No such config: {config_path}\n"
+                         f"Available: {', '.join(available) or '(none)'}")
+    spec = importlib.util.spec_from_file_location(config_name, config_path)
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
+    config = config_module.CONFIG
+
+    price_path = os.path.join(config["data_dir"], "spy_price_history.csv")
+    state_path = os.path.join(config["tables_dir"], "reference_market_state.csv")
 
     if not os.path.exists(price_path) or not os.path.exists(state_path):
+        command = "python3 main.py"
+        if config_name != "config_2023_12_29":
+            command += f" {config_name}"
         raise FileNotFoundError(
-            f"Missing pipeline output. Run `python3 main.py` first to produce\n"
+            f"Missing pipeline output. Run `{command}` first to produce\n"
             f"  {price_path}\n  {state_path}"
         )
 
@@ -381,7 +410,8 @@ def _run_standalone():
     current_price = float(state["spot"])
 
     returns = compute_daily_returns(prices)
-    scenarios = generate_scenarios(current_price, returns, lookback_days=250)
+    scenarios = generate_scenarios(current_price, returns,
+                                   lookback_days=config["lookback_days"])
 
     print(f"Today's SPY price: ${current_price:.2f}")
     print(f"Scenario prices range from ${scenarios['scenario_price'].min():.2f} "
@@ -396,4 +426,6 @@ def _run_standalone():
 
 
 if __name__ == "__main__":
-    _run_standalone()
+    import sys
+
+    _run_standalone(sys.argv[1] if len(sys.argv) > 1 else None)
